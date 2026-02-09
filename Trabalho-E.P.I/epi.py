@@ -2,18 +2,17 @@ import cv2
 import numpy as np
 from ultralytics import YOLO
 import time
-import winsound  # Apenas para Windows
+import winsound  # Apenas Windows
 import threading 
 
 # --- CONFIGURAÇÃO INICIAL ---
 print("Carregando modelo YOLO...")
 model = YOLO("yolov8s-worldv2.pt")
 
-# Vocabulário expandido (melhora detecção)
 model.set_classes([
-    "hard hat", "helmet", "safety helmet",  # IDs 0, 1, 2
-    "person",                               # ID 3
-    "glasses", "eye protection", "goggles"  # IDs 4, 5, 6
+    "hard hat", "helmet", "safety helmet", 
+    "person", 
+    "glasses", "eye protection", "goggles"
 ])
 
 HELMET_IDS = [0, 1, 2]
@@ -33,166 +32,194 @@ def tocar_alarme():
     t = threading.Thread(target=_beep)
     t.start()
 
-# --- FUNÇÕES DE DETECÇÃO DE COR (Mantidas) ---
-def verificar_amarelo_haste(img_crop):
-    if img_crop is None or img_crop.size == 0: return False, None
-    hsv = cv2.cvtColor(img_crop, cv2.COLOR_BGR2HSV)
-    lower = np.array([15, 70, 70]) 
-    upper = np.array([45, 255, 255])
-    mask = cv2.inRange(hsv, lower, upper)
-    kernel = np.ones((5,5), np.uint8)
-    mask_dilated = cv2.dilate(mask, kernel, iterations=2)
-    contours, _ = cv2.findContours(mask_dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    match_found = False
-    if contours:
-        largest_contour = max(contours, key=cv2.contourArea)
-        if cv2.contourArea(largest_contour) > (img_crop.shape[0]*img_crop.shape[1] * 0.005): 
-            match_found = True
-    return match_found, mask_dilated
+# --- FUNÇÕES DE COR (REJEIÇÃO DE ÓCULOS COMUNS) ---
+def verificar_detalhes_epi(img_crop):
+    if img_crop is None or img_crop.size == 0: return False, None, None
 
-def verificar_vermelho_centro(img_crop):
-    if img_crop is None or img_crop.size == 0: return False, None
+    h, w = img_crop.shape[:2]
     hsv = cv2.cvtColor(img_crop, cv2.COLOR_BGR2HSV)
-    lower1, upper1 = np.array([0, 140, 80]), np.array([10, 255, 255])
-    lower2, upper2 = np.array([170, 140, 80]), np.array([180, 255, 255])
-    mask = cv2.inRange(hsv, lower1, upper1) + cv2.inRange(hsv, lower2, upper2)
-    kernel = np.ones((3,3), np.uint8)
-    mask = cv2.dilate(mask, kernel, iterations=1)
-    if (cv2.countNonZero(mask) / (img_crop.shape[0]*img_crop.shape[1])) > 0.025: 
-        return True, mask
-    return False, mask
+    
+    # --- 1. DEFINIÇÃO DE CORES (MAIS RIGOROSA) ---
+    # Amarelo:
+    # H (Matiz): 20-35 (Cortei o 15-20 pois confunde com pele alaranjada)
+    # S (Saturação): 135+ (Só cores MUITO vivas. Metal/Pele tem saturação baixa)
+    # V (Brilho): 120+ (Ignora marrom/amarelo escuro)
+    lower_yellow = np.array([20, 135, 120]) 
+    upper_yellow = np.array([35, 255, 255])
+    
+    # Vermelho (Detalhe Central)
+    lower_red1, upper_red1 = np.array([0, 150, 90]), np.array([8, 255, 255])
+    lower_red2, upper_red2 = np.array([172, 150, 90]), np.array([180, 255, 255])
+
+    # --- 2. CRIAR MÁSCARAS ---
+    mask_yellow = cv2.inRange(hsv, lower_yellow, upper_yellow)
+    mask_red = cv2.inRange(hsv, lower_red1, upper_red1) + cv2.inRange(hsv, lower_red2, upper_red2)
+    
+    # --- 3. EROSÃO (A TÉCNICA CHAVE) ---
+    # Isso apaga linhas finas (armações de metal/grau).
+    # Só sobra o que for GROSSO (hastes de plástico).
+    kernel_erosao = np.ones((3,3), np.uint8)
+    mask_yellow = cv2.erode(mask_yellow, kernel_erosao, iterations=1)
+    
+    # Depois da erosão, dilatamos um pouco para conectar o que sobrou
+    mask_yellow = cv2.dilate(mask_yellow, kernel_erosao, iterations=2)
+    mask_red = cv2.dilate(mask_red, kernel_erosao, iterations=2)
+
+    # --- 4. ANÁLISE POR ZONAS ---
+    largura_haste = int(w * 0.25) # Olhar 25% das bordas
+    roi_esq = mask_yellow[:, :largura_haste]
+    roi_dir = mask_yellow[:, w-largura_haste:]
+    
+    roi_centro_red = mask_red[:, largura_haste:w-largura_haste]
+    
+    pixels_amarelo = cv2.countNonZero(roi_esq) + cv2.countNonZero(roi_dir)
+    pixels_vermelho = cv2.countNonZero(roi_centro_red)
+    
+    area_hastes = (h * largura_haste) * 2
+    area_centro = h * (w - 2*largura_haste)
+
+    # --- 5. VALIDAÇÃO RIGOROSA ---
+    is_valid = False
+
+    # Aumentei a exigência de pixels para 2% da área lateral
+    # Como fizemos erosão, se sobrar 2%, é porque era algo grosso e amarelo.
+    if (pixels_amarelo / area_hastes) > 0.020: 
+        is_valid = True
+    
+    # Vermelho no centro (ponte do nariz ou elástico)
+    elif (pixels_vermelho / area_centro) > 0.025:
+        is_valid = True
+
+    return is_valid, mask_yellow, mask_red
 
 # --- LOOP PRINCIPAL ---
 cap = cv2.VideoCapture(0)
 cap.set(3, 1280)
 cap.set(4, 720)
 
-print("Sistema Iniciado: MODO FOCO (Fundo Desfocado).")
+print("Sistema Iniciado: Modo REJEIÇÃO DE ÓCULOS FINOS.")
 
 while True:
-    success, img_original = cap.read() # Lemos como img_original
+    success, img_original = cap.read()
     if not success: break
 
-    # Cria uma cópia para ser a imagem final exibida
     img_display = img_original.copy()
+    
+    debug_yellow = np.zeros((100,100), dtype=np.uint8)
+    debug_red = np.zeros((100,100), dtype=np.uint8)
 
     results = model.predict(img_original, conf=0.3, imgsz=640, verbose=False)
 
     persons = []
     helmets = []
     epis_olhos_validos = [] 
+    oculos_invalidos = [] 
     
-    # 1. COLETA DE DADOS
     for r in results:
         for box in r.boxes:
             cls = int(box.cls[0])
             coords = list(map(int, box.xyxy[0]))
             x1, y1, x2, y2 = coords
-            conf = float(box.conf[0])
             
             if cls == PERSON_ID:
                 persons.append(coords)
-            
             elif cls in HELMET_IDS:
                 helmets.append(coords)
-            
             elif cls in GLASSES_IDS:
-                # Validação de óculos
+                # Recorte com margem de segurança (para pegar bem a haste)
                 y1_c, y2_c = max(0, y1), min(img_original.shape[0], y2)
                 x1_c, x2_c = max(0, x1), min(img_original.shape[1], x2)
                 glasses_crop = img_original[y1_c:y2_c, x1_c:x2_c]
                 
-                tem_haste, _ = verificar_amarelo_haste(glasses_crop)
-                tem_centro, _ = verificar_vermelho_centro(glasses_crop)
+                eh_valido, m_y, m_r = verificar_detalhes_epi(glasses_crop)
                 
-                if (tem_haste or tem_centro) or (conf > 0.60):
-                    epis_olhos_validos.append(coords)
+                if m_y is not None: debug_yellow = m_y
+                if m_r is not None: debug_red = m_r
 
-    # 2. LÓGICA DE FOCO E DESFOQUE
+                if eh_valido:
+                    epis_olhos_validos.append(coords)
+                else:
+                    oculos_invalidos.append(coords)
+
+    # Foco na Pessoa
     main_person = None
-    
     if persons:
-        # Encontra a pessoa mais próxima (Maior área: largura * altura)
         main_person = max(persons, key=lambda p: (p[2]-p[0]) * (p[3]-p[1]))
-        
-        # PASSO A: Borrar toda a imagem de fundo
-        # (21, 21) é a intensidade do desfoque. Deve ser número ímpar.
         img_blurred = cv2.GaussianBlur(img_original, (21, 21), 0)
-        
-        # PASSO B: Recortar a pessoa nítida da original e colar no fundo borrado
         px1, py1, px2, py2 = main_person
-        
-        # Ajuste de segurança para não sair da tela
         py1, py2 = max(0, py1), min(img_display.shape[0], py2)
         px1, px2 = max(0, px1), min(img_display.shape[1], px2)
-
-        # A imagem exibida vira a borrada
         img_display = img_blurred
-        
-        # "Colamos" a pessoa nítida de volta
         img_display[py1:py2, px1:px2] = img_original[py1:py2, px1:px2]
-
     else:
-        # Se não tem ninguém, mostra tudo borrado ou tudo normal (escolhi tudo borrado)
         img_display = cv2.GaussianBlur(img_original, (21, 21), 0)
 
-    # 3. VALIDAÇÃO E DESENHO (Apenas na Pessoa Principal)
+    # Decisão
     alguma_infracao = False
-
+    
     if main_person:
         px1, py1, px2, py2 = main_person
-        altura_pessoa = py2 - py1
+        h_p = py2 - py1
+        zona_olhos_base = py1 + (h_p * 0.60)
         
-        # Verifica Capacete
-        zona_capacete_topo = py1 - (altura_pessoa * 0.20)
-        zona_capacete_base = py1 + (altura_pessoa * 0.40)
         tem_capacete = False
-        
-        for hx1, hy1, hx2, hy2 in helmets:
-            hcx, hcy = (hx1+hx2)/2, (hy1+hy2)/2
-            # Desenha capacete se estiver perto da pessoa principal
-            if (px1 - 50) <= hcx <= (px2 + 50):
-                cv2.rectangle(img_display, (hx1, hy1), (hx2, hy2), (0, 165, 255), 2)
-                if zona_capacete_topo <= hcy <= zona_capacete_base:
-                    tem_capacete = True
-
-        # Verifica Óculos
         tem_epi_olho = False
+        tem_oculos_comum = False
+        
+        # Capacete
+        for hx1, hy1, hx2, hy2 in helmets:
+            hcx = (hx1+hx2)/2
+            if (px1-50) <= hcx <= (px2+50):
+                tem_capacete = True
+                cv2.rectangle(img_display, (hx1, hy1), (hx2, hy2), (0, 255, 0), 2)
+
+        # EPI (Específico)
         for ex1, ey1, ex2, ey2 in epis_olhos_validos:
             ecx, ecy = (ex1+ex2)/2, (ey1+ey2)/2
-            if px1 <= ecx <= px2 and py1 <= ecy <= (py1 + altura_pessoa * 0.6):
+            if px1 <= ecx <= px2 and ecy <= zona_olhos_base:
                 tem_epi_olho = True
                 cv2.rectangle(img_display, (ex1, ey1), (ex2, ey2), (0, 255, 0), 2)
+                cv2.putText(img_display, "EPI AUTENTICO", (ex1, ey1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2)
                 break
 
-        # Status Final
+        # Óculos Comum (Detectado pelo YOLO mas rejeitado pela cor)
+        if not tem_epi_olho:
+            for ix1, iy1, ix2, iy2 in oculos_invalidos:
+                icx, icy = (ix1+ix2)/2, (iy1+iy2)/2
+                if px1 <= icx <= px2 and icy <= zona_olhos_base:
+                    tem_oculos_comum = True
+                    cv2.rectangle(img_display, (ix1, iy1), (ix2, iy2), (0, 0, 255), 2)
+                    cv2.putText(img_display, "MODELO NAO PERMITIDO", (ix1, iy1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,255), 2)
+
+        # Status
         if tem_capacete and tem_epi_olho:
-            status = "ACESSO LIBERADO"
+            status = "LIBERADO"
             cor = (0, 255, 0)
         else:
             alguma_infracao = True
             cor = (0, 0, 255)
-            if not tem_capacete and not tem_epi_olho: status = "SEM EPIS"
-            elif not tem_capacete: 
-                status = "SEM CAPACETE"
-                cor = (0, 165, 255)
-            elif not tem_epi_olho: status = "SEM OCULOS"
-        
-        # Desenha a caixa apenas na pessoa focada
+            if not tem_capacete: status = "SEM CAPACETE"
+            elif tem_oculos_comum: status = "OCULOS PROIBIDO"
+            else: status = "SEM OCULOS"
+            
         cv2.rectangle(img_display, (px1, py1), (px2, py2), cor, 3)
-        cv2.putText(img_display, status, (px1, py1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 1.0, cor, 3)
+        cv2.putText(img_display, status, (px1, py1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 1, cor, 3)
 
-    # --- ALARME ---
     if alguma_infracao:
-        agora = time.time()
-        if agora - ultimo_aviso > INTERVALO_AVISO:
+        if time.time() - ultimo_aviso > INTERVALO_AVISO:
             tocar_alarme()
-            ultimo_aviso = agora
+            ultimo_aviso = time.time()
 
-    cv2.imshow("Detector EPI - Efeito Foco", img_display)
+    cv2.imshow("Detector", img_display)
+    
+    # Observe estas janelas:
+    # Óculos COMUM deve ficar TUDO PRETO (a erosão apaga as linhas finas)
+    # EPI deve mostrar MANCHAS BRANCAS GORDAS
+    cv2.imshow("Debug Amarelo", cv2.resize(debug_yellow, (200, 100)))
+    cv2.imshow("Debug Vermelho", cv2.resize(debug_red, (200, 100)))
 
     if cv2.waitKey(1) & 0xFF == ord('q'):
         break
- 
+
 cap.release()
 cv2.destroyAllWindows()
