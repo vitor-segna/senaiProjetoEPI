@@ -26,8 +26,7 @@ DB_CONFIG = {
 EPI_OCULOS_ID = 1
 EPI_CAPACETE_ID = 2
 
-# --- CONFIGURAÇÃO DAS CLASSES DO YOLO (ATUALIZADO) ---
-# Definimos classes específicas para ajudar na detecção de óculos transparentes
+# --- CONFIGURAÇÃO DAS CLASSES DO YOLO ---
 CLASSES_YOLO = [
     "hard hat", "helmet", "safety helmet",  # 0, 1, 2 (Capacetes)
     "person",                               # 3 (Pessoa)
@@ -36,7 +35,7 @@ CLASSES_YOLO = [
 
 HELMET_CLASSES = [0, 1, 2] 
 PERSON_CLASS = 3
-GLASSES_CLASSES = [4, 5, 6, 7] # Lista expandida
+GLASSES_CLASSES = [4, 5, 6, 7]
 
 # Ajuste de Reconhecimento Facial
 LIMITE_CONFIANCA = 60  # (Menor = mais rigoroso)
@@ -141,24 +140,59 @@ def registrar_multa(frame_evidencia, aluno_id, falta_capacete, falta_oculos):
         print(f"[ERRO BD] {e}")
 
 # ==============================================================================
-# 4. FUNÇÕES DE ANÁLISE VISUAL
+# 4. FUNÇÕES DE ANÁLISE VISUAL (COR)
 # ==============================================================================
 
-# NOTA: A função de verificar cor do óculos foi removida para aceitar óculos transparentes/escuros.
-
 def verificar_hsv_capacete(img_crop):
-    """ Verifica se o capacete tem uma cor válida (não é apenas cabelo preto/escuro) """
+    """ Verifica se o capacete tem uma cor válida """
     if img_crop is None or img_crop.size == 0: return False
     h, w = img_crop.shape[:2]
-    topo = img_crop[0:int(h*0.7), :] # Pega apenas o topo
+    topo = img_crop[0:int(h*0.7), :] 
     hsv = cv2.cvtColor(topo, cv2.COLOR_BGR2HSV)
-    
-    # Range amplo para pegar cores (Amarelo, Branco, Vermelho, Azul, Laranja)
-    # Exclui tons muito escuros/pretos (Saturation/Value baixos)
     mask_valid = cv2.inRange(hsv, np.array([0, 0, 60]), np.array([180, 255, 255]))
-    
     ratio = cv2.countNonZero(mask_valid) / (topo.shape[0]*topo.shape[1])
     return ratio > 0.35
+
+def verificar_cor_epi_oculos(img_crop):
+    """
+    Verifica se o óculos tem detalhes AMARELOS (hastes) ou VERMELHOS (frente).
+    Retorna True se for EPI, False se for óculos comum.
+    """
+    if img_crop is None or img_crop.size == 0: return False
+    
+    # Converter para HSV
+    hsv = cv2.cvtColor(img_crop, cv2.COLOR_BGR2HSV)
+    
+    # --- CORES DO EPI ---
+    
+    # 1. AMARELO (Hastes) - Range de Amarelo
+    lower_yellow = np.array([20, 100, 100])
+    upper_yellow = np.array([35, 255, 255])
+    mask_yellow = cv2.inRange(hsv, lower_yellow, upper_yellow)
+    
+    # 2. VERMELHO (Detalhe Frontal) - Range duplo no HSV
+    lower_red1 = np.array([0, 100, 100])
+    upper_red1 = np.array([10, 255, 255])
+    lower_red2 = np.array([170, 100, 100])
+    upper_red2 = np.array([180, 255, 255])
+    
+    mask_red = cv2.add(cv2.inRange(hsv, lower_red1, upper_red1), cv2.inRange(hsv, lower_red2, upper_red2))
+    
+    # Junta as duas máscaras (Amarelo OU Vermelho)
+    mask_final = cv2.add(mask_yellow, mask_red)
+    
+    # Calcula porcentagem de cor na imagem do óculos
+    pixels_coloridos = cv2.countNonZero(mask_final)
+    total_pixels = img_crop.shape[0] * img_crop.shape[1]
+    
+    ratio = pixels_coloridos / total_pixels
+    
+    # Se mais de 2% da área do recorte tiver essas cores, é o EPI correto
+    # (Valor baixo pois são apenas DETALHES nas hastes/frente)
+    if ratio > 0.02: 
+        return True
+    
+    return False
 
 # ==============================================================================
 # 5. LOOP PRINCIPAL
@@ -185,7 +219,7 @@ while True:
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     
     # ---------------------------------------------------------
-    # MODO CADASTRO (Sem blur, para melhor visualização)
+    # MODO CADASTRO
     # ---------------------------------------------------------
     if modo_cadastro:
         faces_rect = face_cascade.detectMultiScale(gray, 1.2, 5)
@@ -208,7 +242,7 @@ while True:
     # MODO VIGILÂNCIA
     # ---------------------------------------------------------
     else:
-        # 1. Detecta objetos (Confiança 0.35 para pegar óculos melhor)
+        # Detecta objetos
         results = model.predict(frame, conf=0.35, verbose=False, imgsz=640)
         
         pessoas_yolo = []
@@ -223,10 +257,10 @@ while True:
                 elif cls in HELMET_CLASSES: capacetes.append(coords)
                 elif cls in GLASSES_CLASSES: oculos_detectados.append(coords)
 
-        # 2. Cria fundo borrado
+        # Fundo borrado
         frame_display = cv2.GaussianBlur(frame, (51, 51), 0)
 
-        # 3. Encontra a pessoa principal (maior área na tela)
+        # Encontra a pessoa principal
         pessoa_foco = None
         maior_area = 0
 
@@ -238,18 +272,16 @@ while True:
                 maior_area = area
                 pessoa_foco = p
 
-        # 4. Se existir alguém, foca nele
         if pessoa_foco is not None:
             px1, py1, px2, py2 = pessoa_foco
             
-            # Recorta a parte nítida do frame original e cola no frame borrado
             h_img, w_img = frame.shape[:2]
             px1, py1 = max(0, px1), max(0, py1)
             px2, py2 = min(w_img, px2), min(h_img, py2)
             
             frame_display[py1:py2, px1:px2] = frame[py1:py2, px1:px2]
 
-            # --- ANÁLISE DE SEGURANÇA (APENAS NA PESSOA FOCADA) ---
+            # --- ANÁLISE DE SEGURANÇA ---
             cor_box = (0, 255, 0) # Verde
             
             # Identificação Facial
@@ -276,13 +308,13 @@ while True:
 
             # Verificação de EPI
             h_person = py2 - py1
-            zona_cabeca = py1 + (h_person * 0.3) # 30% superior para cabeça
-            zona_olhos = py1 + (h_person * 0.5)  # 50% superior para óculos
+            zona_cabeca = py1 + (h_person * 0.3)
+            zona_olhos = py1 + (h_person * 0.5)
             
             tem_capacete = False
             tem_oculos = False
             
-            # Checa Capacete
+            # 1. CAPACETE
             for (hx1, hy1, hx2, hy2) in capacetes:
                 hcx = (hx1 + hx2) / 2
                 if px1 < hcx < px2 and hy1 < zona_cabeca:
@@ -291,18 +323,31 @@ while True:
                         tem_capacete = True
                         cv2.rectangle(frame_display, (hx1, hy1), (hx2, hy2), (0, 255, 0), 2)
             
-            # Checa Óculos (LÓGICA CORRIGIDA AQUI)
-            # Removemos a verificação de cor. Se o YOLO detectou "glasses" na cara da pessoa, é válido.
+            # 2. ÓCULOS (COM VERIFICAÇÃO DE DETALHES AMARELOS/VERMELHOS)
             for (ox1, oy1, ox2, oy2) in oculos_detectados:
                 ocx = (ox1 + ox2) / 2
                 ocy = (oy1 + oy2) / 2
                 
-                # Verifica se o centro do óculos está alinhado horizontalmente com a pessoa
-                # E se está na metade superior do corpo (região da cabeça/olhos)
                 if px1 < ocx < px2 and oy1 < ocy < zona_olhos:
-                    tem_oculos = True
-                    cv2.rectangle(frame_display, (ox1, oy1), (ox2, oy2), (0, 255, 0), 2)
-                    cv2.putText(frame_display, "EPI", (ox1, oy1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 2)
+                    # Expande o recorte horizontalmente para pegar as hastes laterais
+                    largura_oculos = ox2 - ox1
+                    margem_x = int(largura_oculos * 0.2) # 20% de margem
+                    
+                    crop_x1 = max(0, ox1 - margem_x)
+                    crop_x2 = min(w_img, ox2 + margem_x)
+                    
+                    # Recorta o óculos (com margem)
+                    crop_oculos = frame[oy1:oy2, crop_x1:crop_x2]
+                    
+                    # Verifica se tem amarelo ou vermelho
+                    if verificar_cor_epi_oculos(crop_oculos):
+                        tem_oculos = True
+                        cv2.rectangle(frame_display, (ox1, oy1), (ox2, oy2), (0, 255, 0), 2)
+                        cv2.putText(frame_display, "EPI OK", (ox1, oy1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 2)
+                    else:
+                        # Detectou óculos, mas não tem as cores do EPI -> Óculos comum
+                        cv2.rectangle(frame_display, (ox1, oy1), (ox2, oy2), (255, 0, 0), 1)
+                        cv2.putText(frame_display, "Pessoal", (ox1, oy1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255,0,0), 1)
 
             # Lógica de Infração
             falha = not (tem_capacete and tem_oculos)
@@ -317,52 +362,34 @@ while True:
                     if identidade_id not in tempo_infracao:
                         tempo_infracao[identidade_id] = time.time()
                     elif time.time() - tempo_infracao[identidade_id] > 3.0:
-                        # Dispara thread para não travar vídeo enquanto salva
                         threading.Thread(target=registrar_multa, args=(frame.copy(), identidade_id, not tem_capacete, not tem_oculos)).start()
-                        tempo_infracao[identidade_id] = time.time() + 10 # Delay entre multas
+                        tempo_infracao[identidade_id] = time.time() + 10
                 else:
                     if identidade_id in tempo_infracao: del tempo_infracao[identidade_id]
             else:
                 if identidade_id in tempo_infracao: del tempo_infracao[identidade_id]
 
-            # Desenha interface final
             cv2.rectangle(frame_display, (px1, py1), (px2, py2), cor_box, 2)
             cv2.putText(frame_display, f"{identidade_nome} | {status_texto}", (px1, py1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, cor_box, 2)
             cv2.putText(frame_display, "[ALVO FOCADO]", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
 
         cv2.imshow("EPI GUARD ULTIMATE", frame_display)
     
-    # ---------------------------------------------------------
-    # CONTROLES DO TECLADO
-    # ---------------------------------------------------------
     k = cv2.waitKey(1)
     if k == ord('q'): 
         break
     
     elif k == ord('c') and not modo_cadastro:
-        print(">>> ABRINDO JANELA DE CADASTRO... <<<")
-        
-        # Cria janela invisível do Tkinter apenas para gerenciar os diálogos
         root = tk.Tk()
         root.withdraw() 
-        root.attributes('-topmost', True) # Garante que apareça na frente do vídeo
-        
-        # 1. Pede o ID
+        root.attributes('-topmost', True)
         cad_id = simpledialog.askinteger("Novo Cadastro", "Digite o ID do Usuário (Número):", parent=root)
-        
-        # 2. Se digitou ID, pede o Nome
         if cad_id is not None:
             cad_nome = simpledialog.askstring("Novo Cadastro", "Digite o NOME do Usuário:", parent=root)
-            
             if cad_nome:
                 modo_cadastro = True
                 print(f"[CADASTRO] Iniciando captura para: {cad_nome} (ID: {cad_id})")
-            else:
-                print("[CADASTRO] Nome em branco. Cancelado.")
-        else:
-            print("[CADASTRO] Cancelado pelo usuário.")
-            
-        root.destroy() # Fecha o Tkinter para não conflitar com o OpenCV
+        root.destroy()
 
 cap.release()
 cv2.destroyAllWindows()
