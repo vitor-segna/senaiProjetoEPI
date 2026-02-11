@@ -17,7 +17,7 @@ from tkinter import simpledialog
 DB_CONFIG = {
     'host': 'localhost',
     'user': 'root',
-    'password': '',       # <--- SUA SENHA
+    'password': '',       # <--- SUA SENHA AQUI
     'database': 'epi_guard', 
     'port': 3308
 }
@@ -25,6 +25,7 @@ DB_CONFIG = {
 EPI_OCULOS_ID = 1
 EPI_CAPACETE_ID = 2
 
+# Classes do modelo Yolo World
 CLASSES_YOLO = [
     "hard hat", "helmet", "safety helmet",           # 0, 1, 2
     "person",                                        # 3
@@ -36,12 +37,13 @@ HELMET_CLASSES = [0, 1, 2]
 PERSON_CLASS = 3
 ALL_EYEWEAR = [4, 5, 6, 7, 8, 9]
 
-LIMITE_CONFIANCA = 60 
+LIMITE_CONFIANCA_FACE = 60
 
 # ==============================================================================
 # 2. INICIALIZAÇÃO
 # ==============================================================================
 print("[SISTEMA] Carregando Modelos...")
+# Certifique-se de que o arquivo .pt está na mesma pasta
 model = YOLO("yolov8s-worldv2.pt") 
 model.set_classes(CLASSES_YOLO)
 
@@ -52,7 +54,7 @@ nomes_conhecidos = {}
 modelo_treinado = False
 
 # ==============================================================================
-# 3. BANCO E TREINO
+# 3. BANCO DE DADOS E TREINAMENTO
 # ==============================================================================
 def inicializar_banco():
     try:
@@ -76,6 +78,7 @@ def treinar_modelo():
         cursor = conn.cursor()
         cursor.execute("SELECT id, nome FROM alunos")
         nomes_conhecidos = {row[0]: row[1] for row in cursor.fetchall()}
+        
         cursor.execute("SELECT aluno_id, imagem FROM amostras_facial")
         faces, ids = [], []
         for uid, blob in cursor.fetchall():
@@ -85,11 +88,14 @@ def treinar_modelo():
                 if img is not None:
                     faces.append(cv2.resize(img, (200, 200)))
                     ids.append(uid)
+        
         if len(faces) > 0:
             recognizer.train(faces, np.array(ids))
             modelo_treinado = True
+            print(f"[TREINO] Modelo treinado com {len(faces)} faces.")
         else:
             modelo_treinado = False
+            
         conn.close()
     except Exception as e:
         print(f"[ERRO TREINO] {e}")
@@ -118,12 +124,12 @@ def registrar_multa(frame_evidencia, aluno_id, falta_capacete, falta_oculos):
         
         if falta_capacete:
             cursor.execute("INSERT INTO ocorrencias (aluno_id, data_hora, epi_id) VALUES (%s, NOW(), %s)", (aluno_id, EPI_CAPACETE_ID))
-            id1 = cursor.lastrowid
-            cursor.execute("INSERT INTO evidencias (ocorrencia_id, imagem) VALUES (%s, %s)", (id1, nome_arquivo))
+            id_last = cursor.lastrowid
+            cursor.execute("INSERT INTO evidencias (ocorrencia_id, imagem) VALUES (%s, %s)", (id_last, nome_arquivo))
         if falta_oculos:
             cursor.execute("INSERT INTO ocorrencias (aluno_id, data_hora, epi_id) VALUES (%s, NOW(), %s)", (aluno_id, EPI_OCULOS_ID))
-            id2 = cursor.lastrowid
-            cursor.execute("INSERT INTO evidencias (ocorrencia_id, imagem) VALUES (%s, %s)", (id2, nome_arquivo))
+            id_last = cursor.lastrowid
+            cursor.execute("INSERT INTO evidencias (ocorrencia_id, imagem) VALUES (%s, %s)", (id_last, nome_arquivo))
         
         conn.commit()
         conn.close()
@@ -133,7 +139,7 @@ def registrar_multa(frame_evidencia, aluno_id, falta_capacete, falta_oculos):
         print(f"[ERRO MULTA] {e}")
 
 # ==============================================================================
-# 4. FUNÇÕES DE ANÁLISE VISUAL (AJUSTADA PARA DETALHES PEQUENOS)
+# 4. ANÁLISE VISUAL (OTIMIZADA)
 # ==============================================================================
 
 def verificar_hsv_capacete(img_crop):
@@ -147,67 +153,65 @@ def verificar_hsv_capacete(img_crop):
 
 def verificar_cor_epi_oculos(img_crop):
     """
-    DETECTA DETALHES PEQUENOS (HASTES AMARELAS / CENTRO VERMELHO).
-    Removemos a limpeza de ruído agressiva e focamos em encontrar
-    os pixels das cores específicas nas posições esperadas.
+    Detecta hastes amarelas nas laterais OU detalhe vermelho no centro.
+    Inclui visualização de DEBUG.
     """
     if img_crop is None or img_crop.size == 0: return False
     
+    # Redimensiona para padronizar a quantidade de pixels
+    img_crop = cv2.resize(img_crop, (150, 60)) 
     h, w = img_crop.shape[:2]
     
-    # Analisa a metade superior onde ficam as hastes e o nariz
-    roi = img_crop[0:int(h * 0.5), :]
+    hsv = cv2.cvtColor(img_crop, cv2.COLOR_BGR2HSV)
     
-    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    # --- AJUSTES DE COR (IMPORTANTE) ---
+    # Saturação (S) > 90: Elimina cinza, branco e preto (óculos normais).
+    # Valor (V) > 70: Elimina sombras muito escuras.
     
-    # --- AJUSTE DE SENSIBILIDADE ---
-    # Baixamos a Saturação Mínima para 100 para pegar amarelo em sombra ou fino
-    sat_min = 100
-    val_min = 80
-
-    # 1. DEFINIR CORES
-    # Amarelo (Hastes)
-    lower_yellow = np.array([18, sat_min, val_min])
-    upper_yellow = np.array([35, 255, 255])
+    # Amarelo (Hastes): Hue 18 a 40
+    lower_yellow = np.array([18, 90, 70]) 
+    upper_yellow = np.array([40, 255, 255])
     
-    # Vermelho (Detalhe Central)
-    lower_red1 = np.array([0, sat_min, val_min])
+    # Vermelho (Detalhe): Hue 0-10 e 170-180
+    lower_red1 = np.array([0, 100, 70])
     upper_red1 = np.array([10, 255, 255])
-    lower_red2 = np.array([170, sat_min, val_min])
+    lower_red2 = np.array([170, 100, 70])
     upper_red2 = np.array([180, 255, 255])
 
-    # 2. CRIAR MÁSCARAS
+    # Cria Máscaras
     mask_yellow = cv2.inRange(hsv, lower_yellow, upper_yellow)
-    mask_red = cv2.add(cv2.inRange(hsv, lower_red1, upper_red1), cv2.inRange(hsv, lower_red2, upper_red2))
+    mask_red = cv2.add(cv2.inRange(hsv, lower_red1, upper_red1), 
+                       cv2.inRange(hsv, lower_red2, upper_red2))
 
-    # --- TRUQUE: DILATAÇÃO ---
-    # Como as hastes são finas, vamos "engrossar" o que achamos para facilitar a contagem
-    # Em vez de apagar (erosão), vamos aumentar (dilatação)
-    kernel = np.ones((3,3), np.uint8)
-    mask_yellow = cv2.dilate(mask_yellow, kernel, iterations=1)
-    mask_red = cv2.dilate(mask_red, kernel, iterations=1)
+    # Combina para visualização de debug
+    mask_total = cv2.add(mask_yellow, mask_red)
+    
+    # >>> JANELA DE DEBUG <<<
+    # Se ficar tudo PRETO aqui, o código não está vendo a cor.
+    # Se aparecerem manchas brancas nas laterais, ele está vendo.
+    cv2.imshow("DEBUG - VISAO DO ROBO", mask_total)
 
-    # 3. CONTAGEM POR ZONA (OPCIONAL, MAS AJUDA)
-    # Total de pixels na imagem recortada
-    total_pixels = roi.shape[0] * roi.shape[1]
+    # Separação por Zonas
+    # Zona Esquerda (30%): Onde fica a haste esquerda
+    zona_esq = mask_yellow[:, 0:int(w*0.30)]
     
-    count_yellow = cv2.countNonZero(mask_yellow)
-    count_red = cv2.countNonZero(mask_red)
+    # Zona Direita (30%): Onde fica a haste direita
+    zona_dir = mask_yellow[:, int(w*0.70):w]
     
-    ratio_yellow = count_yellow / total_pixels
-    ratio_red = count_red / total_pixels
+    # Zona Centro (20%): Onde fica o detalhe vermelho
+    zona_centro = mask_red[:, int(w*0.40):int(w*0.60)]
 
-    # --- LÓGICA FINAL ---
-    # Como são detalhes PEQUENOS, a porcentagem aceitável deve ser BAIXA.
-    # Exigimos: 
-    # - OU 2% de Amarelo (Hastes laterais)
-    # - OU 1% de Vermelho (Detalhe no nariz)
-    
-    tem_detalhe_amarelo = ratio_yellow > 0.02
-    tem_detalhe_vermelho = ratio_red > 0.01
-    
-    # Se tiver qualquer um dos dois detalhes vivos, é considerado EPI
-    if tem_detalhe_amarelo or tem_detalhe_vermelho:
+    # Contagem de Pixels Brancos (Detectados)
+    pixels_esq = cv2.countNonZero(zona_esq)
+    pixels_dir = cv2.countNonZero(zona_dir)
+    pixels_centro = cv2.countNonZero(zona_centro)
+
+    # Regras de Aprovação (Basta ter um pouco de cor)
+    # 20 pixels é um agrupamento pequeno, suficiente para haste fina
+    tem_haste = (pixels_esq > 20) or (pixels_dir > 20)
+    tem_detalhe = pixels_centro > 15
+
+    if tem_haste or tem_detalhe:
         return True
 
     return False
@@ -227,7 +231,7 @@ cadastro_count = 0
 cad_id, cad_nome = 0, ""
 tempo_infracao = {} 
 
-print("\n>>> SISTEMA PRONTO <<<")
+print("\n>>> SISTEMA PRONTO - Pressione 'c' para cadastrar, 'q' para sair <<<")
 
 while True:
     ret, frame = cap.read()
@@ -252,6 +256,7 @@ while True:
         cv2.imshow("EPI GUARD ULTIMATE", frame)
 
     else:
+        # Detecção YOLO
         results = model.predict(frame, conf=0.35, verbose=False, imgsz=640)
         
         pessoas_yolo = []
@@ -262,17 +267,13 @@ while True:
             for box in r.boxes:
                 coords = list(map(int, box.xyxy[0]))
                 cls = int(box.cls[0])
-                
-                if cls == PERSON_CLASS: 
-                    pessoas_yolo.append(coords)
-                elif cls in HELMET_CLASSES: 
-                    capacetes.append(coords)
-                elif cls in ALL_EYEWEAR:
-                    oculos_detectados.append(coords)
+                if cls == PERSON_CLASS: pessoas_yolo.append(coords)
+                elif cls in HELMET_CLASSES: capacetes.append(coords)
+                elif cls in ALL_EYEWEAR: oculos_detectados.append(coords)
 
-        frame_display = cv2.GaussianBlur(frame, (21, 21), 0)
+        frame_display = frame.copy()
 
-        # Foca na maior pessoa
+        # Foca na pessoa principal
         pessoa_foco = None
         maior_area = 0
         for p in pessoas_yolo:
@@ -286,8 +287,8 @@ while True:
             h_img, w_img = frame.shape[:2]
             px1, py1 = max(0, px1), max(0, py1)
             px2, py2 = min(w_img, px2), min(h_img, py2)
-            frame_display[py1:py2, px1:px2] = frame[py1:py2, px1:px2]
-
+            
+            # Reconhecimento Facial
             roi_gray = gray[py1:py2, px1:px2]
             faces_haar = face_cascade.detectMultiScale(roi_gray, 1.1, 5)
             identidade_id = None
@@ -295,15 +296,15 @@ while True:
             
             if len(faces_haar) > 0 and modelo_treinado:
                 (fx, fy, fw, fh) = max(faces_haar, key=lambda b: b[2]*b[3])
-                rosto_x, rosto_y = px1 + fx, py1 + fy
                 try:
                     roi_face = cv2.resize(roi_gray[fy:fy+fh, fx:fx+fw], (200, 200))
                     uid, dist = recognizer.predict(roi_face)
-                    if dist < LIMITE_CONFIANCA:
+                    if dist < LIMITE_CONFIANCA_FACE:
                         identidade_id = uid
                         identidade_nome = nomes_conhecidos.get(uid, f"ID {uid}")
                 except: pass
 
+            # Análise EPI
             h_person = py2 - py1
             zona_cabeca = py1 + (h_person * 0.35)
             zona_olhos = py1 + (h_person * 0.55)
@@ -311,57 +312,61 @@ while True:
             tem_capacete = False
             tem_oculos = False
             
-            # --- CAPACETE ---
+            # Capacete
             for (hx1, hy1, hx2, hy2) in capacetes:
                 hcx = (hx1 + hx2) / 2
                 if px1 < hcx < px2 and hy1 < zona_cabeca:
-                    crop = frame[hy1:hy2, hx1:hx2] 
-                    if verificar_hsv_capacete(crop):
+                    if verificar_hsv_capacete(frame[hy1:hy2, hx1:hx2]):
                         tem_capacete = True
                         cv2.rectangle(frame_display, (hx1, hy1), (hx2, hy2), (0, 255, 0), 2)
-                        cv2.putText(frame_display, "CAPACETE", (hx1, hy1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 2)
 
-            # --- ÓCULOS ---
+            # Óculos (COM EXPANSÃO LATERAL)
             for (ox1, oy1, ox2, oy2) in oculos_detectados:
                 ocx, ocy = (ox1 + ox2) / 2, (oy1 + oy2) / 2
-                
                 if px1 < ocx < px2 and py1 < ocy < zona_olhos:
-                    # Margem lateral maior (30%) para pegar bem as hastes
+                    # --- EXPANSÃO CRÍTICA ---
+                    # Aumentamos 50% para os lados para pegar as hastes
                     largura = ox2 - ox1
-                    mx = int(largura * 0.3) 
-                    crop_x1, crop_x2 = max(0, ox1 - mx), min(w_img, ox2 + mx)
+                    margem = int(largura * 0.5) 
+                    
+                    crop_x1 = max(0, ox1 - margem)
+                    crop_x2 = min(w_img, ox2 + margem)
+                    
                     crop_oculos = frame[oy1:oy2, crop_x1:crop_x2]
                     
-                    if verificar_cor_epi_oculos(crop_oculos):
+                    eh_epi = verificar_cor_epi_oculos(crop_oculos)
+                    
+                    if eh_epi:
                         tem_oculos = True
                         cv2.rectangle(frame_display, (ox1, oy1), (ox2, oy2), (0, 255, 0), 2)
-                        cv2.putText(frame_display, "EPI DETALHES", (ox1, oy1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 2)
+                        cv2.putText(frame_display, "EPI OK", (ox1, oy1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 2)
                     else:
                         cv2.rectangle(frame_display, (ox1, oy1), (ox2, oy2), (0, 0, 255), 2)
-                        cv2.putText(frame_display, "OCULOS COMUM", (ox1, oy2+15), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,255), 2)
+                        cv2.putText(frame_display, "COMUM", (ox1, oy2+15), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,255), 2)
 
+            # Status Final
             falha = not (tem_capacete and tem_oculos)
-            status_texto = "EPI OK"
             cor_box = (0, 255, 0)
+            status_texto = "APROVADO"
 
             if falha:
                 cor_box = (0, 0, 255)
                 status_texto = "INFRACAO"
                 if not tem_capacete: status_texto += " [CAPACETE]"
                 if not tem_oculos: status_texto += " [OCULOS]"
-
+                
                 if identidade_id:
+                    agora = time.time()
                     if identidade_id not in tempo_infracao:
-                        tempo_infracao[identidade_id] = time.time()
-                    elif time.time() - tempo_infracao[identidade_id] > 3.0:
+                        tempo_infracao[identidade_id] = agora
+                    elif agora - tempo_infracao[identidade_id] > 3.0:
                         threading.Thread(target=registrar_multa, args=(frame.copy(), identidade_id, not tem_capacete, not tem_oculos)).start()
-                        tempo_infracao[identidade_id] = time.time() + 10
+                        tempo_infracao[identidade_id] = agora + 10
             else:
                 if identidade_id in tempo_infracao: del tempo_infracao[identidade_id]
 
             cv2.rectangle(frame_display, (px1, py1), (px2, py2), cor_box, 2)
-            cv2.putText(frame_display, f"{identidade_nome}", (px1, py1-30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, cor_box, 2)
-            cv2.putText(frame_display, f"{status_texto}", (px1, py1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, cor_box, 2)
+            cv2.putText(frame_display, f"{identidade_nome} | {status_texto}", (px1, py1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, cor_box, 2)
 
         cv2.imshow("EPI GUARD ULTIMATE", frame_display)
     
@@ -371,10 +376,12 @@ while True:
         root = tk.Tk()
         root.withdraw() 
         root.attributes('-topmost', True)
-        cad_id = simpledialog.askinteger("Cadastro", "ID:", parent=root)
-        if cad_id:
-            cad_nome = simpledialog.askstring("Cadastro", "Nome:", parent=root)
-            if cad_nome: modo_cadastro = True
+        cid = simpledialog.askinteger("Cadastro", "ID:", parent=root)
+        if cid:
+            cnome = simpledialog.askstring("Cadastro", "Nome:", parent=root)
+            if cnome: 
+                cad_id, cad_nome = cid, cnome
+                modo_cadastro = True
         root.destroy()
 
 cap.release()
