@@ -117,24 +117,43 @@ def registrar_multa(frame_evidencia, aluno_id, falta_capacete, falta_oculos):
     try:
         conn = mysql.connector.connect(**DB_CONFIG)
         cursor = conn.cursor()
-        timestamp = time.strftime("%Y%m%d_%H%M%S")
-        nome_arquivo = f"multa_{aluno_id}_{timestamp}.jpg"
-        if not os.path.exists("evidencias"): os.makedirs("evidencias")
-        cv2.imwrite(f"evidencias/{nome_arquivo}", frame_evidencia)
-        
+
+        # Converte imagem para JPG em memória (BLOB)
+        _, buffer = cv2.imencode('.jpg', frame_evidencia)
+        imagem_bytes = buffer.tobytes()
+
         if falta_capacete:
-            cursor.execute("INSERT INTO ocorrencias (aluno_id, data_hora, epi_id) VALUES (%s, NOW(), %s)", (aluno_id, EPI_CAPACETE_ID))
+            cursor.execute(
+                "INSERT INTO ocorrencias (aluno_id, data_hora, epi_id) VALUES (%s, NOW(), %s)",
+                (aluno_id, EPI_CAPACETE_ID)
+            )
             id_last = cursor.lastrowid
-            cursor.execute("INSERT INTO evidencias (ocorrencia_id, imagem) VALUES (%s, %s)", (id_last, nome_arquivo))
+
+            cursor.execute(
+                "INSERT INTO evidencias (ocorrencia_id, imagem) VALUES (%s, %s)",
+                (id_last, imagem_bytes)
+            )
+
         if falta_oculos:
-            cursor.execute("INSERT INTO ocorrencias (aluno_id, data_hora, epi_id) VALUES (%s, NOW(), %s)", (aluno_id, EPI_OCULOS_ID))
+            cursor.execute(
+                "INSERT INTO ocorrencias (aluno_id, data_hora, epi_id) VALUES (%s, NOW(), %s)",
+                (aluno_id, EPI_OCULOS_ID)
+            )
             id_last = cursor.lastrowid
-            cursor.execute("INSERT INTO evidencias (ocorrencia_id, imagem) VALUES (%s, %s)", (id_last, nome_arquivo))
-        
+
+            cursor.execute(
+                "INSERT INTO evidencias (ocorrencia_id, imagem) VALUES (%s, %s)",
+                (id_last, imagem_bytes)
+            )
+
         conn.commit()
         conn.close()
+
         print(f"[MULTA] Registrada para ID {aluno_id}.")
+
+        # Som Windows
         threading.Thread(target=lambda: winsound.Beep(2500, 1000)).start()
+
     except Exception as e:
         print(f"[ERRO MULTA] {e}")
 
