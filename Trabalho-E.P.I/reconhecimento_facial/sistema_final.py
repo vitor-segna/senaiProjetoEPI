@@ -169,65 +169,48 @@ def verificar_hsv_capacete(img_crop):
     mask_valid = cv2.inRange(hsv, np.array([0, 0, 50]), np.array([180, 255, 255]))
     ratio = cv2.countNonZero(mask_valid) / (topo.shape[0]*topo.shape[1])
     return ratio > 0.35
-
 def verificar_cor_epi_oculos(img_crop):
-    """
-    Detecta:
-    ✔ Hastes amarelas nas laterais
-    ✔ Detalhe vermelho central
-    Retorna True se for EPI válido
-    """
 
     if img_crop is None or img_crop.size == 0:
         return False
 
-    # Redimensiona para padronizar análise
-    img_crop = cv2.resize(img_crop, (180, 80))
-    h, w = img_crop.shape[:2]
+    img_crop = cv2.resize(img_crop, (200, 90))
+    img_crop = cv2.GaussianBlur(img_crop, (5,5), 0)
 
+    h, w = img_crop.shape[:2]
     hsv = cv2.cvtColor(img_crop, cv2.COLOR_BGR2HSV)
 
     # ==============================
-    # 1️⃣ MÁSCARA AMARELA (HASTES)
+    # 🟡 AMARELO MAIS CONTROLADO
     # ==============================
     lower_yellow = np.array([18, 120, 120])
     upper_yellow = np.array([38, 255, 255])
     mask_yellow = cv2.inRange(hsv, lower_yellow, upper_yellow)
 
+    kernel = np.ones((3,3), np.uint8)
+    mask_yellow = cv2.morphologyEx(mask_yellow, cv2.MORPH_CLOSE, kernel)
+
     # ==============================
-    # 2️⃣ MÁSCARA VERMELHA (CENTRO)
+    # 🔴 VERMELHO CENTRAL
     # ==============================
     lower_red1 = np.array([0, 140, 100])
     upper_red1 = np.array([8, 255, 255])
     lower_red2 = np.array([170, 140, 100])
     upper_red2 = np.array([180, 255, 255])
 
-    mask_red1 = cv2.inRange(hsv, lower_red1, upper_red1)
-    mask_red2 = cv2.inRange(hsv, lower_red2, upper_red2)
-    mask_red = mask_red1 + mask_red2
-
-    # ==============================
-    # 3️⃣ LIMPEZA MORFOLÓGICA
-    # ==============================
-    kernel = np.ones((3,3), np.uint8)
-
-    mask_yellow = cv2.morphologyEx(mask_yellow, cv2.MORPH_CLOSE, kernel)
-    mask_yellow = cv2.morphologyEx(mask_yellow, cv2.MORPH_OPEN, kernel)
+    mask_red = cv2.inRange(hsv, lower_red1, upper_red1) + \
+               cv2.inRange(hsv, lower_red2, upper_red2)
 
     mask_red = cv2.morphologyEx(mask_red, cv2.MORPH_CLOSE, kernel)
-    mask_red = cv2.morphologyEx(mask_red, cv2.MORPH_OPEN, kernel)
 
     # ==============================
-    # 4️⃣ DIVISÃO EM ZONAS
+    # DIVISÃO DAS ZONAS
     # ==============================
 
     largura_lateral = int(w * 0.30)
 
-    # Laterais (hastes)
     zona_esquerda = mask_yellow[:, :largura_lateral]
     zona_direita = mask_yellow[:, w - largura_lateral:]
-
-    # Centro (detalhe vermelho)
     zona_centro = mask_red[:, int(w*0.35):int(w*0.65)]
 
     pixels_esq = cv2.countNonZero(zona_esquerda)
@@ -238,19 +221,22 @@ def verificar_cor_epi_oculos(img_crop):
     area_centro = zona_centro.shape[0] * zona_centro.shape[1]
 
     # ==============================
-    # 5️⃣ REGRAS INTELIGENTES
+    # 🔒 REGRAS MAIS RÍGIDAS
     # ==============================
 
-    tem_haste_amarela = (pixels_esq / area_lateral > 0.015) or \
-                        (pixels_dir / area_lateral > 0.015)
+    amarelo_esq = (pixels_esq / area_lateral) > 0.03
+    amarelo_dir = (pixels_dir / area_lateral) > 0.03
 
-    tem_detalhe_vermelho = (pixels_centro / area_centro > 0.02)
+    vermelho_central = (pixels_centro / area_centro) > 0.025
 
-    # DEBUG OPCIONAL (descomente se quiser ver)
-    # cv2.imshow("DEBUG AMARELO", mask_yellow)
-    # cv2.imshow("DEBUG VERMELHO", mask_red)
+    # REGRA FINAL:
+    # 1) Se tem vermelho forte → aceita
+    # 2) Se tem amarelo nas DUAS laterais → aceita
 
-    if tem_haste_amarela or tem_detalhe_vermelho:
+    if vermelho_central:
+        return True
+
+    if amarelo_esq and amarelo_dir:
         return True
 
     return False
