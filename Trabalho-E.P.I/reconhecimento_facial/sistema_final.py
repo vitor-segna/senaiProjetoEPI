@@ -172,69 +172,88 @@ def verificar_hsv_capacete(img_crop):
 
 def verificar_cor_epi_oculos(img_crop):
     """
-    Detecta hastes amarelas nas laterais OU detalhe vermelho no centro.
-    Inclui visualização de DEBUG.
+    Detecta:
+    ✔ Hastes amarelas nas laterais
+    ✔ Detalhe vermelho central
+    Retorna True se for EPI válido
     """
-    if img_crop is None or img_crop.size == 0: return False
-    
-    # Redimensiona para padronizar a quantidade de pixels
-    img_crop = cv2.resize(img_crop, (150, 60)) 
+
+    if img_crop is None or img_crop.size == 0:
+        return False
+
+    # Redimensiona para padronizar análise
+    img_crop = cv2.resize(img_crop, (180, 80))
     h, w = img_crop.shape[:2]
-    
+
     hsv = cv2.cvtColor(img_crop, cv2.COLOR_BGR2HSV)
-    
-    # --- AJUSTES DE COR (IMPORTANTE) ---
-    # Saturação (S) > 90: Elimina cinza, branco e preto (óculos normais).
-    # Valor (V) > 70: Elimina sombras muito escuras.
-    
-    # Amarelo (Hastes): Hue 18 a 40
-    lower_yellow = np.array([18, 90, 70]) 
-    upper_yellow = np.array([40, 255, 255])
-    
-    # Vermelho (Detalhe): Hue 0-10 e 170-180
-    lower_red1 = np.array([0, 100, 70])
-    upper_red1 = np.array([10, 255, 255])
-    lower_red2 = np.array([170, 100, 70])
+
+    # ==============================
+    # 1️⃣ MÁSCARA AMARELA (HASTES)
+    # ==============================
+    lower_yellow = np.array([18, 120, 120])
+    upper_yellow = np.array([38, 255, 255])
+    mask_yellow = cv2.inRange(hsv, lower_yellow, upper_yellow)
+
+    # ==============================
+    # 2️⃣ MÁSCARA VERMELHA (CENTRO)
+    # ==============================
+    lower_red1 = np.array([0, 140, 100])
+    upper_red1 = np.array([8, 255, 255])
+    lower_red2 = np.array([170, 140, 100])
     upper_red2 = np.array([180, 255, 255])
 
-    # Cria Máscaras
-    mask_yellow = cv2.inRange(hsv, lower_yellow, upper_yellow)
-    mask_red = cv2.add(cv2.inRange(hsv, lower_red1, upper_red1), 
-                       cv2.inRange(hsv, lower_red2, upper_red2))
+    mask_red1 = cv2.inRange(hsv, lower_red1, upper_red1)
+    mask_red2 = cv2.inRange(hsv, lower_red2, upper_red2)
+    mask_red = mask_red1 + mask_red2
 
-    # Combina para visualização de debug
-    mask_total = cv2.add(mask_yellow, mask_red)
-    
-    # >>> JANELA DE DEBUG <<<
-    # Se ficar tudo PRETO aqui, o código não está vendo a cor.
-    # Se aparecerem manchas brancas nas laterais, ele está vendo.
-    cv2.imshow("DEBUG - VISAO DO ROBO", mask_total)
+    # ==============================
+    # 3️⃣ LIMPEZA MORFOLÓGICA
+    # ==============================
+    kernel = np.ones((3,3), np.uint8)
 
-    # Separação por Zonas
-    # Zona Esquerda (30%): Onde fica a haste esquerda
-    zona_esq = mask_yellow[:, 0:int(w*0.30)]
-    
-    # Zona Direita (30%): Onde fica a haste direita
-    zona_dir = mask_yellow[:, int(w*0.70):w]
-    
-    # Zona Centro (20%): Onde fica o detalhe vermelho
-    zona_centro = mask_red[:, int(w*0.40):int(w*0.60)]
+    mask_yellow = cv2.morphologyEx(mask_yellow, cv2.MORPH_CLOSE, kernel)
+    mask_yellow = cv2.morphologyEx(mask_yellow, cv2.MORPH_OPEN, kernel)
 
-    # Contagem de Pixels Brancos (Detectados)
-    pixels_esq = cv2.countNonZero(zona_esq)
-    pixels_dir = cv2.countNonZero(zona_dir)
+    mask_red = cv2.morphologyEx(mask_red, cv2.MORPH_CLOSE, kernel)
+    mask_red = cv2.morphologyEx(mask_red, cv2.MORPH_OPEN, kernel)
+
+    # ==============================
+    # 4️⃣ DIVISÃO EM ZONAS
+    # ==============================
+
+    largura_lateral = int(w * 0.30)
+
+    # Laterais (hastes)
+    zona_esquerda = mask_yellow[:, :largura_lateral]
+    zona_direita = mask_yellow[:, w - largura_lateral:]
+
+    # Centro (detalhe vermelho)
+    zona_centro = mask_red[:, int(w*0.35):int(w*0.65)]
+
+    pixels_esq = cv2.countNonZero(zona_esquerda)
+    pixels_dir = cv2.countNonZero(zona_direita)
     pixels_centro = cv2.countNonZero(zona_centro)
 
-    # Regras de Aprovação (Basta ter um pouco de cor)
-    # 20 pixels é um agrupamento pequeno, suficiente para haste fina
-    tem_haste = (pixels_esq > 20) or (pixels_dir > 20)
-    tem_detalhe = pixels_centro > 15
+    area_lateral = zona_esquerda.shape[0] * zona_esquerda.shape[1]
+    area_centro = zona_centro.shape[0] * zona_centro.shape[1]
 
-    if tem_haste or tem_detalhe:
+    # ==============================
+    # 5️⃣ REGRAS INTELIGENTES
+    # ==============================
+
+    tem_haste_amarela = (pixels_esq / area_lateral > 0.015) or \
+                        (pixels_dir / area_lateral > 0.015)
+
+    tem_detalhe_vermelho = (pixels_centro / area_centro > 0.02)
+
+    # DEBUG OPCIONAL (descomente se quiser ver)
+    # cv2.imshow("DEBUG AMARELO", mask_yellow)
+    # cv2.imshow("DEBUG VERMELHO", mask_red)
+
+    if tem_haste_amarela or tem_detalhe_vermelho:
         return True
 
     return False
-
 # ==============================================================================
 # 5. LOOP PRINCIPAL
 # ==============================================================================
