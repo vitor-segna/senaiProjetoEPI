@@ -304,9 +304,19 @@ def gerar_frames():
         ret, buffer = cv2.imencode('.jpg', frame_display)
         frame_bytes = buffer.tobytes()
         
-        yield (b'--frame\r\n'
-               b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+        # Adicione este bloco TRY/EXCEPT para capturar quando o PHP cortar o vídeo
+        try:
+            yield (b'--frame\r\n'
+                   b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+        except GeneratorExit:
+            # O navegador fechou a conexão (você apertou o botão vermelho)
+            print("Conexão de vídeo encerrada pelo painel.")
+            break # Isso quebra o loop "while True"
+        except Exception as e:
+            print(f"Erro na transmissão: {e}")
+            break
 
+    # Ao quebrar o loop, a câmera é finalmente liberada (apaga a luzinha)
     cap.release()
 
 # ==============================================================================
