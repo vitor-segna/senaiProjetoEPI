@@ -5,20 +5,20 @@ from ultralytics import YOLO
 import threading
 import time
 import os
-import winsound
-from flask import Flask, Response # <-- ADICIONADO PARA WEB
-from flask_cors import CORS # Para permitir que o PHP leia o vídeo
+import winsound # Apenas para Windows
+from flask import Flask, Response
+from flask_cors import CORS
 
 app = Flask(__name__)
 CORS(app)
 
 # ==============================================================================
-# 1. CONFIGURAÇÕES (MANTIDAS DO SEU CÓDIGO)
+# 1. CONFIGURAÇÕES
 # ==============================================================================
 DB_CONFIG = {
     'host': 'localhost',
     'user': 'root',
-    'password': '',
+    'password': '',       # Confirme sua senha
     'database': 'epi_guard', 
     'port': 3308
 }
@@ -37,8 +37,13 @@ PERSON_CLASS = 3
 ALL_EYEWEAR = [4, 5, 6, 7, 8, 9]
 LIMITE_CONFIANCA_FACE = 60
 
+# Variáveis Globais
+nomes_conhecidos = {}
+modelo_treinado = False
+tempo_infracao = {}
+
 # ==============================================================================
-# 2. INICIALIZAÇÃO (MANTIDA)
+# 2. INICIALIZAÇÃO DOS MODELOS
 # ==============================================================================
 print("[SISTEMA] Carregando Modelos...")
 model = YOLO("yolov8s-worldv2.pt") 
@@ -47,33 +52,158 @@ model.set_classes(CLASSES_YOLO)
 face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
 recognizer = cv2.face.LBPHFaceRecognizer_create()
 
-nomes_conhecidos = {}
-modelo_treinado = False
-tempo_infracao = {} 
+# ==============================================================================
+# 3. FUNÇÕES DE BANCO DE DADOS E LÓGICA DE EPI
+# ==============================================================================
+def inicializar_banco():
+    try:
+        conn = mysql.connector.connect(**DB_CONFIG)
+        cursor = conn.cursor()
+        cursor.execute("CREATE TABLE IF NOT EXISTS alunos (id INT PRIMARY KEY, nome VARCHAR(100))")
+        cursor.execute("CREATE TABLE IF NOT EXISTS amostras_facial (id INT AUTO_INCREMENT PRIMARY KEY, aluno_id INT, imagem LONGBLOB)")
+        cursor.execute("CREATE TABLE IF NOT EXISTS ocorrencias (id INT AUTO_INCREMENT PRIMARY KEY, aluno_id INT, data_hora DATETIME, epi_id INT)")
+        cursor.execute("CREATE TABLE IF NOT EXISTS evidencias (id INT AUTO_INCREMENT PRIMARY KEY, ocorrencia_id INT, imagem LONGBLOB)")
+        cursor.execute("CREATE TABLE IF NOT EXISTS epis (id INT PRIMARY KEY, nome VARCHAR(50))")
+        cursor.execute("INSERT IGNORE INTO epis (id, nome) VALUES (1, 'Oculos'), (2, 'Capacete')")
+        conn.commit()
+        conn.close()
+        print("[BD] Banco inicializado com sucesso.")
+    except Exception as e:
+        print(f"[ERRO BD] {e}")
 
-# ... (MANTENHA SUAS FUNÇÕES AQUI: inicializar_banco(), treinar_modelo(), registrar_multa(), verificar_hsv_capacete(), verificar_cor_epi_oculos()) ...
-# Nota: Estou omitindo as funções por brevidade, mas você deve copiar e colar exatamente como estavam no seu código original.
+def treinar_modelo():
+    global modelo_treinado, nomes_conhecidos
+    try:
+        conn = mysql.connector.connect(**DB_CONFIG)
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, nome FROM alunos")
+        nomes_conhecidos = {row[0]: row[1] for row in cursor.fetchall()}
+        
+        cursor.execute("SELECT aluno_id, imagem FROM amostras_facial")
+        faces, ids = [], []
+        for uid, blob in cursor.fetchall():
+            if blob:
+                nparr = np.frombuffer(blob, np.uint8)
+                img = cv2.imdecode(nparr, cv2.IMREAD_GRAYSCALE)
+                if img is not None:
+                    faces.append(cv2.resize(img, (200, 200)))
+                    ids.append(uid)
+        
+        if len(faces) > 0:
+            recognizer.train(faces, np.array(ids))
+            modelo_treinado = True
+            print(f"[TREINO] Modelo facial treinado com {len(faces)} faces.")
+        else:
+            modelo_treinado = False
+            print("[TREINO] Nenhuma face cadastrada ainda.")
+        conn.close()
+    except Exception as e:
+        print(f"[ERRO TREINO] {e}")
+
+def registrar_multa(frame_evidencia, aluno_id, falta_capacete, falta_oculos):
+    try:
+        conn = mysql.connector.connect(**DB_CONFIG)
+        cursor = conn.cursor()
+        _, buffer = cv2.imencode('.jpg', frame_evidencia)
+        imagem_bytes = buffer.tobytes()
+
+        if falta_capacete:
+            cursor.execute("INSERT INTO ocorrencias (aluno_id, data_hora, epi_id) VALUES (%s, NOW(), %s)", (aluno_id, EPI_CAPACETE_ID))
+            id_last = cursor.lastrowid
+            cursor.execute("INSERT INTO evidencias (ocorrencia_id, imagem) VALUES (%s, %s)", (id_last, imagem_bytes))
+
+        if falta_oculos:
+            cursor.execute("INSERT INTO ocorrencias (aluno_id, data_hora, epi_id) VALUES (%s, NOW(), %s)", (aluno_id, EPI_OCULOS_ID))
+            id_last = cursor.lastrowid
+            cursor.execute("INSERT INTO evidencias (ocorrencia_id, imagem) VALUES (%s, %s)", (id_last, imagem_bytes))
+
+        conn.commit()
+        conn.close()
+        print(f"[MULTA] Registrada no banco para o ID {aluno_id}.")
+        threading.Thread(target=lambda: winsound.Beep(2500, 1000)).start()
+    except Exception as e:
+        print(f"[ERRO MULTA] {e}")
+
+def verificar_hsv_capacete(img_crop):
+    if img_crop is None or img_crop.size == 0: return False
+    h, w = img_crop.shape[:2]
+    topo = img_crop[0:int(h*0.7), :] 
+    hsv = cv2.cvtColor(topo, cv2.COLOR_BGR2HSV)
+    mask_valid = cv2.inRange(hsv, np.array([0, 0, 50]), np.array([180, 255, 255]))
+    ratio = cv2.countNonZero(mask_valid) / (topo.shape[0]*topo.shape[1])
+    return ratio > 0.35
+
+def verificar_cor_epi_oculos(img_crop):
+    if img_crop is None or img_crop.size == 0: return False
+    
+    # Redimensiona para padronizar
+    img_crop = cv2.resize(img_crop, (200, 90))
+    img_crop = cv2.GaussianBlur(img_crop, (5,5), 0)
+    h, w = img_crop.shape[:2]
+    hsv = cv2.cvtColor(img_crop, cv2.COLOR_BGR2HSV)
+
+    # 1. Expandindo a faixa do Amarelo (para pegar iluminações diferentes/sombras)
+    lower_yellow = np.array([15, 80, 80])
+    upper_yellow = np.array([45, 255, 255])
+    mask_yellow = cv2.inRange(hsv, lower_yellow, upper_yellow)
+    
+    # 2. Expandindo a faixa do Vermelho (inclusive vermelhos mais escuros)
+    lower_red1 = np.array([0, 100, 70])
+    upper_red1 = np.array([10, 255, 255])
+    lower_red2 = np.array([160, 100, 70])
+    upper_red2 = np.array([180, 255, 255])
+    mask_red = cv2.inRange(hsv, lower_red1, upper_red1) + cv2.inRange(hsv, lower_red2, upper_red2)
+
+    # Operações morfológicas para juntar os pedacinhos de cor e tirar ruído
+    kernel = np.ones((5,5), np.uint8)
+    mask_yellow = cv2.morphologyEx(mask_yellow, cv2.MORPH_CLOSE, kernel)
+    mask_red = cv2.morphologyEx(mask_red, cv2.MORPH_CLOSE, kernel)
+
+    # 3. Ajustando as Zonas (mais flexíveis para quando virar o rosto)
+    # Aumentando a margem lateral para 40% para pegar as hastes mesmo de perfil
+    largura_lateral = int(w * 0.40) 
+    zona_esquerda = mask_yellow[:, :largura_lateral]
+    zona_direita = mask_yellow[:, w - largura_lateral:]
+    
+    # O centro vermelho foi expandido (de 20% a 80% da largura) para acompanhar a virada de rosto
+    zona_centro = mask_red[:, int(w*0.20):int(w*0.80)]
+
+    # Contagem de pixels
+    pixels_esq = cv2.countNonZero(zona_esquerda)
+    pixels_dir = cv2.countNonZero(zona_direita)
+    pixels_centro = cv2.countNonZero(zona_centro)
+    
+    area_lateral = zona_esquerda.shape[0] * zona_esquerda.shape[1]
+    area_centro = zona_centro.shape[0] * zona_centro.shape[1]
+
+    # 4. Reduzindo a exigência de porcentagem (agora 1.5% a 2% de pixels já é suficiente)
+    amarelo_esq = (pixels_esq / area_lateral) > 0.02
+    amarelo_dir = (pixels_dir / area_lateral) > 0.02
+    vermelho_central = (pixels_centro / area_centro) > 0.015
+
+    # 5. Nova Lógica: Aprova se ver vermelho NO MEIO ou amarelo EM QUALQUER UMA das hastes
+    if vermelho_central or amarelo_esq or amarelo_dir: 
+        return True
+        
+    return False
 
 # ==============================================================================
-# 3. GERADOR DE FRAMES PARA A WEB
+# 4. GERADOR DE FRAMES COM LÓGICA APLICADA
 # ==============================================================================
 def gerar_frames():
-    global tempo_infracao
+    global tempo_infracao, modelo_treinado, nomes_conhecidos
     cap = cv2.VideoCapture(0)
-    cap.set(3, 640)
-    cap.set(4, 360)
+    cap.set(3, 1280)
+    cap.set(4, 720)
+
     while True:
         ret, frame = cap.read()
         if not ret: break
         
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        
-        # --- AQUI COMEÇA SUA LÓGICA DO YOLO E FACE RECOGNITION ---
         results = model.predict(frame, conf=0.35, verbose=False, imgsz=640)
         
-        pessoas_yolo = []
-        capacetes = []
-        oculos_detectados = []
+        pessoas_yolo, capacetes, oculos_detectados = [], [], []
         
         for r in results:
             for box in r.boxes:
@@ -85,7 +215,6 @@ def gerar_frames():
 
         frame_display = frame.copy()
         
-        # Foca na pessoa principal
         pessoa_foco = None
         maior_area = 0
         for p in pessoas_yolo:
@@ -100,20 +229,78 @@ def gerar_frames():
             px1, py1 = max(0, px1), max(0, py1)
             px2, py2 = min(w_img, px2), min(h_img, py2)
             
-            # Reconhecimento Facial (simplificado por espaço)
             roi_gray = gray[py1:py2, px1:px2]
             faces_haar = face_cascade.detectMultiScale(roi_gray, 1.1, 5)
             identidade_id = None
             identidade_nome = "Desconhecido"
-            # ... Resto da sua lógica de face e EPI ...
             
-            # Desenha as caixas e textos no frame_display (sua lógica existente)
-            cv2.rectangle(frame_display, (px1, py1), (px2, py2), (0, 255, 0), 2)
-            cv2.putText(frame_display, f"{identidade_nome}", (px1, py1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            if len(faces_haar) > 0 and modelo_treinado:
+                (fx, fy, fw, fh) = max(faces_haar, key=lambda b: b[2]*b[3])
+                try:
+                    roi_face = cv2.resize(roi_gray[fy:fy+fh, fx:fx+fw], (200, 200))
+                    uid, dist = recognizer.predict(roi_face)
+                    if dist < LIMITE_CONFIANCA_FACE:
+                        identidade_id = uid
+                        identidade_nome = nomes_conhecidos.get(uid, f"ID {uid}")
+                except: pass
 
-        # --- FIM DA LÓGICA DO YOLO ---
+            h_person = py2 - py1
+            zona_cabeca = py1 + (h_person * 0.35)
+            zona_olhos = py1 + (h_person * 0.55)
+            
+            tem_capacete, tem_oculos = False, False
+            
+            # Checagem Capacete
+            for (hx1, hy1, hx2, hy2) in capacetes:
+                hcx = (hx1 + hx2) / 2
+                if px1 < hcx < px2 and hy1 < zona_cabeca:
+                    if verificar_hsv_capacete(frame[hy1:hy2, hx1:hx2]):
+                        tem_capacete = True
+                        cv2.rectangle(frame_display, (hx1, hy1), (hx2, hy2), (0, 255, 0), 2)
 
-        # 4. CONVERSÃO PARA A WEB (Substitui o cv2.imshow)
+            # Checagem Óculos
+            for (ox1, oy1, ox2, oy2) in oculos_detectados:
+                ocx, ocy = (ox1 + ox2) / 2, (oy1 + oy2) / 2
+                if px1 < ocx < px2 and py1 < ocy < zona_olhos:
+                    largura = ox2 - ox1
+                    margem = int(largura * 0.5) 
+                    crop_x1 = max(0, ox1 - margem)
+                    crop_x2 = min(w_img, ox2 + margem)
+                    crop_oculos = frame[oy1:oy2, crop_x1:crop_x2]
+                    
+                    if verificar_cor_epi_oculos(crop_oculos):
+                        tem_oculos = True
+                        cv2.rectangle(frame_display, (ox1, oy1), (ox2, oy2), (0, 255, 0), 2)
+                        cv2.putText(frame_display, "EPI OK", (ox1, oy1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 2)
+                    else:
+                        cv2.rectangle(frame_display, (ox1, oy1), (ox2, oy2), (0, 0, 255), 2)
+                        cv2.putText(frame_display, "COMUM", (ox1, oy2+15), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,255), 2)
+
+            # Lógica de Infração e Banco de Dados
+            falha = not (tem_capacete and tem_oculos)
+            cor_box = (0, 255, 0)
+            status_texto = "APROVADO"
+
+            if falha:
+                cor_box = (0, 0, 255)
+                status_texto = "INFRACAO"
+                if not tem_capacete: status_texto += " [CAPACETE]"
+                if not tem_oculos: status_texto += " [OCULOS]"
+                
+                if identidade_id:
+                    agora = time.time()
+                    if identidade_id not in tempo_infracao:
+                        tempo_infracao[identidade_id] = agora
+                    # Aguarda 3 segundos de infração contínua para multar
+                    elif agora - tempo_infracao[identidade_id] > 3.0:
+                        threading.Thread(target=registrar_multa, args=(frame.copy(), identidade_id, not tem_capacete, not tem_oculos)).start()
+                        tempo_infracao[identidade_id] = agora + 10 # Dá 10 segundos de carência antes da próxima
+            else:
+                if identidade_id in tempo_infracao: del tempo_infracao[identidade_id]
+
+            cv2.rectangle(frame_display, (px1, py1), (px2, py2), cor_box, 2)
+            cv2.putText(frame_display, f"{identidade_nome} | {status_texto}", (px1, py1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, cor_box, 2)
+
         ret, buffer = cv2.imencode('.jpg', frame_display)
         frame_bytes = buffer.tobytes()
         
@@ -130,7 +317,8 @@ def video_feed():
     return Response(gerar_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
 if __name__ == '__main__':
-    # inicializar_banco()
-    # treinar_modelo()
-    print(">>> Servidor de Vídeo rodando em http://localhost:5000/video_feed <<<")
+    # Descomentado para preparar o ambiente antes de rodar o servidor Web
+    inicializar_banco()
+    treinar_modelo()
+    print(">>> Servidor Web de Visão Computacional rodando em http://localhost:5000/video_feed <<<")
     app.run(host='0.0.0.0', port=5000, threaded=True)
