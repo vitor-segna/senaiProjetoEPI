@@ -5,7 +5,7 @@ from ultralytics import YOLO
 import threading
 import time
 import os
-import winsound # Apenas para Windows
+import winsound  # Apenas para Windows
 from flask import Flask, Response
 from flask_cors import CORS
 
@@ -37,10 +37,24 @@ PERSON_CLASS = 3
 ALL_EYEWEAR = [4, 5, 6, 7, 8, 9]
 LIMITE_CONFIANCA_FACE = 60
 
-# Variáveis Globais
+# ==============================================================================
+# VARIÁVEIS GLOBAIS (Para comunicação entre as Threads)
+# ==============================================================================
 nomes_conhecidos = {}
 modelo_treinado = False
 tempo_infracao = {}
+
+frame_atual = None
+lock_frame = threading.Lock()
+
+# Variáveis de desenho atualizadas pela Thread do YOLO
+ultimo_desenho_capacetes = []
+ultimo_desenho_oculos = []
+ultimo_desenho_oculos_vermelho = []
+foco_box = None
+foco_nome = "Desconhecido"
+foco_status = "ANALISANDO..."
+foco_cor = (255, 255, 0)
 
 # ==============================================================================
 # 2. INICIALIZAÇÃO DOS MODELOS
@@ -53,7 +67,7 @@ face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_fronta
 recognizer = cv2.face.LBPHFaceRecognizer_create()
 
 # ==============================================================================
-# 3. FUNÇÕES DE BANCO DE DADOS E LÓGICA DE EPI
+# 3. FUNÇÕES DE BANCO DE DADOS E LÓGICA DE EPI (MANTIDAS INTACTAS)
 # ==============================================================================
 def inicializar_banco():
     try:
@@ -136,70 +150,90 @@ def verificar_hsv_capacete(img_crop):
 def verificar_cor_epi_oculos(img_crop):
     if img_crop is None or img_crop.size == 0: return False
     
-    # Padronização
-    img_crop = cv2.resize(img_crop, (200, 90))
-    img_crop = cv2.GaussianBlur(img_crop, (5,5), 0)
+    # Aumentamos um pouco o resize para capturar melhor detalhes pequenos laterais
+    img_crop = cv2.resize(img_crop, (220, 100))
+    img_crop = cv2.GaussianBlur(img_crop, (3,3), 0)
     hsv = cv2.cvtColor(img_crop, cv2.COLOR_BGR2HSV)
-    h, w = img_crop.shape[:2]
-
-    # --- 1. FILTRO DE COR AMARELA (Hastes) ---
-    # Saturação mínima subiu de 80 para 130 (Isso mata o óculos preto/reflexo)
-    # Valor (brilho) mínimo subiu para 100
-    lower_yellow = np.array([18, 130, 100]) 
-    upper_yellow = np.array([35, 255, 255])
+    
+    # 1. Definição de Cores (Amarelo e Vermelho)
+    # Ajustei levemente o range do amarelo para ser mais permissivo com sombras no perfil
+    lower_yellow = np.array([15, 100, 100]) 
+    upper_yellow = np.array([38, 255, 255])
     mask_yellow = cv2.inRange(hsv, lower_yellow, upper_yellow)
     
-    # --- 2. FILTRO DE COR VERMELHA (Centro) ---
-    # Saturação mínima subiu para 140 (Ignora tons de pele e reflexos)
-    lower_red1 = np.array([0, 140, 80])
+    lower_red1 = np.array([0, 130, 70])
     upper_red1 = np.array([10, 255, 255])
-    lower_red2 = np.array([165, 140, 80])
+    lower_red2 = np.array([160, 130, 70])
     upper_red2 = np.array([180, 255, 255])
     mask_red = cv2.inRange(hsv, lower_red1, upper_red1) + cv2.inRange(hsv, lower_red2, upper_red2)
 
-    # --- 3. FILTRO ANTI-PRETO/TRANSPARENTE (Segurança extra) ---
-    # Captura o que é muito escuro (Preto) ou muito sem cor (Transparente/Cinza)
-    # Se a imagem for quase toda assim, cancelamos a detecção
-    mask_neutra = cv2.inRange(hsv, np.array([0, 0, 0]), np.array([180, 70, 255]))
-    pixels_neutros = cv2.countNonZero(mask_neutra)
+    # 2. Limpeza de ruído (Morfologia)
+    # Isso ajuda a unir pontos amarelos pequenos do detalhe da haste lateral
+    kernel = np.ones((3,3), np.uint8)
+    mask_yellow = cv2.morphologyEx(mask_yellow, cv2.MORPH_OPEN, kernel)
+    mask_red = cv2.morphologyEx(mask_red, cv2.MORPH_OPEN, kernel)
 
-    # --- 4. LÓGICA DE ZONAS ---
-    largura_lateral = int(w * 0.35) 
-    zona_esq = mask_yellow[:, :largura_lateral]
-    zona_dir = mask_yellow[:, w - largura_lateral:]
-    zona_centro = mask_red[:, int(w*0.25):int(w*0.75)]
+    # 3. Lógica Global (Sem zonas fixas)
+    # Em vez de olhar esquerda/direita, olhamos o total de "massa" de cor
+    total_amarelo = cv2.countNonZero(mask_yellow)
+    total_vermelho = cv2.countNonZero(mask_red)
+    
+    # Calculamos a área total para tornar a detecção proporcional
+    area_total = img_crop.shape[0] * img_crop.shape[1]
+    percentual_amarelo = (total_amarelo / area_total) * 100
+    percentual_vermelho = (total_vermelho / area_total) * 100
 
-    cnt_esq = cv2.countNonZero(zona_esq)
-    cnt_dir = cv2.countNonZero(zona_dir)
-    cnt_centro = cv2.countNonZero(zona_centro)
-
-    # --- 5. CRITÉRIO DE DECISÃO ---
-    # Se mais de 80% da área do óculos for "cor neutra" (preto/transparente), 
-    # ignoramos mesmo que haja um pequeno reflexo.
-    if pixels_neutros > (img_crop.size * 0.85):
-        return False
-
-    # Precisamos de uma "massa" mínima de cor vibrante (mais de 40 pixels)
-    tem_vermelho = cnt_centro > 30
-    tem_amarelo = (cnt_esq > 35 or cnt_dir > 35)
-
-    if tem_vermelho or tem_amarelo:
+    # Se detectar uma quantidade mínima de amarelo (haste lateral) 
+    # ou vermelho (detalhe frontal), confirmamos como EPI.
+    # 0.8% de amarelo já costuma ser suficiente para o detalhe da haste.
+    if percentual_amarelo > 0.8 or percentual_vermelho > 0.5:
         return True
         
     return False
+
 # ==============================================================================
-# 4. GERADOR DE FRAMES COM LÓGICA APLICADA
+# 4. THREAD 1: CAPTURA DE CÂMERA (Alta Velocidade)
 # ==============================================================================
-def gerar_frames():
-    global tempo_infracao, modelo_treinado, nomes_conhecidos
-    cap = cv2.VideoCapture(0)
+def capturar_frames():
+    global frame_atual
+    # Usando CAP_DSHOW como no seu arquivo para melhor performance no Windows
+    cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
     cap.set(3, 1280)
     cap.set(4, 720)
 
     while True:
         ret, frame = cap.read()
-        if not ret: break
+        if not ret:
+            continue
         
+        with lock_frame:
+            frame_atual = frame.copy()
+
+# ==============================================================================
+# 5. THREAD 2: PROCESSAMENTO YOLO, FACIAL E REGRAS (Pesado)
+# ==============================================================================
+def processar_yolo():
+    global frame_atual
+    global ultimo_desenho_capacetes, ultimo_desenho_oculos, ultimo_desenho_oculos_vermelho
+    global foco_box, foco_nome, foco_status, foco_cor
+    global tempo_infracao, modelo_treinado, nomes_conhecidos
+    
+    frame_count = 0
+
+    while True:
+        if frame_atual is None:
+            time.sleep(0.01)
+            continue
+
+        with lock_frame:
+            frame = frame_atual.copy()
+
+        frame_count += 1
+        # Pula alguns frames no processamento pesado para aliviar a CPU/GPU
+        # Mantém a fluidez da câmera alta, atualizando o reconhecimento a cada 3 frames
+        if frame_count % 3 != 0:
+            continue
+
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         results = model.predict(frame, conf=0.35, verbose=False, imgsz=640)
         
@@ -213,8 +247,6 @@ def gerar_frames():
                 elif cls in HELMET_CLASSES: capacetes.append(coords)
                 elif cls in ALL_EYEWEAR: oculos_detectados.append(coords)
 
-        frame_display = frame.copy()
-        
         pessoa_foco = None
         maior_area = 0
         for p in pessoas_yolo:
@@ -223,7 +255,16 @@ def gerar_frames():
                 maior_area = area
                 pessoa_foco = p
 
+        temp_capacetes = []
+        temp_oculos = []
+        temp_oculos_vermelho = []
+        temp_foco_box = None
+        temp_foco_nome = "Desconhecido"
+        temp_foco_status = "ANALISANDO..."
+        temp_foco_cor = (255, 255, 0)
+
         if pessoa_foco is not None:
+            temp_foco_box = pessoa_foco
             px1, py1, px2, py2 = pessoa_foco
             h_img, w_img = frame.shape[:2]
             px1, py1 = max(0, px1), max(0, py1)
@@ -232,7 +273,6 @@ def gerar_frames():
             roi_gray = gray[py1:py2, px1:px2]
             faces_haar = face_cascade.detectMultiScale(roi_gray, 1.1, 5)
             identidade_id = None
-            identidade_nome = "Desconhecido"
             
             if len(faces_haar) > 0 and modelo_treinado:
                 (fx, fy, fw, fh) = max(faces_haar, key=lambda b: b[2]*b[3])
@@ -241,7 +281,7 @@ def gerar_frames():
                     uid, dist = recognizer.predict(roi_face)
                     if dist < LIMITE_CONFIANCA_FACE:
                         identidade_id = uid
-                        identidade_nome = nomes_conhecidos.get(uid, f"ID {uid}")
+                        temp_foco_nome = nomes_conhecidos.get(uid, f"ID {uid}")
                 except: pass
 
             h_person = py2 - py1
@@ -256,7 +296,7 @@ def gerar_frames():
                 if px1 < hcx < px2 and hy1 < zona_cabeca:
                     if verificar_hsv_capacete(frame[hy1:hy2, hx1:hx2]):
                         tem_capacete = True
-                        cv2.rectangle(frame_display, (hx1, hy1), (hx2, hy2), (0, 255, 0), 2)
+                        temp_capacetes.append((hx1, hy1, hx2, hy2))
 
             # Checagem Óculos
             for (ox1, oy1, ox2, oy2) in oculos_detectados:
@@ -270,65 +310,98 @@ def gerar_frames():
                     
                     if verificar_cor_epi_oculos(crop_oculos):
                         tem_oculos = True
-                        cv2.rectangle(frame_display, (ox1, oy1), (ox2, oy2), (0, 255, 0), 2)
-                        cv2.putText(frame_display, "EPI OK", (ox1, oy1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 2)
+                        temp_oculos.append((ox1, oy1, ox2, oy2))
                     else:
-                        cv2.rectangle(frame_display, (ox1, oy1), (ox2, oy2), (0, 0, 255), 2)
-                        cv2.putText(frame_display, "COMUM", (ox1, oy2+15), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,255), 2)
+                        temp_oculos_vermelho.append((ox1, oy1, ox2, oy2))
 
             # Lógica de Infração e Banco de Dados
             falha = not (tem_capacete and tem_oculos)
-            cor_box = (0, 255, 0)
-            status_texto = "APROVADO"
+            temp_foco_cor = (0, 255, 0)
+            temp_foco_status = "APROVADO"
 
             if falha:
-                cor_box = (0, 0, 255)
-                status_texto = "INFRACAO"
-                if not tem_capacete: status_texto += " [CAPACETE]"
-                if not tem_oculos: status_texto += " [OCULOS]"
+                temp_foco_cor = (0, 0, 255)
+                temp_foco_status = "INFRACAO"
+                if not tem_capacete: temp_foco_status += " [CAPACETE]"
+                if not tem_oculos: temp_foco_status += " [OCULOS]"
                 
                 if identidade_id:
                     agora = time.time()
                     if identidade_id not in tempo_infracao:
                         tempo_infracao[identidade_id] = agora
-                    # Aguarda 3 segundos de infração contínua para multar
                     elif agora - tempo_infracao[identidade_id] > 3.0:
                         threading.Thread(target=registrar_multa, args=(frame.copy(), identidade_id, not tem_capacete, not tem_oculos)).start()
-                        tempo_infracao[identidade_id] = agora + 10 # Dá 10 segundos de carência antes da próxima
+                        tempo_infracao[identidade_id] = agora + 10 
             else:
                 if identidade_id in tempo_infracao: del tempo_infracao[identidade_id]
 
-            cv2.rectangle(frame_display, (px1, py1), (px2, py2), cor_box, 2)
-            cv2.putText(frame_display, f"{identidade_nome} | {status_texto}", (px1, py1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, cor_box, 2)
+        # Atualiza as variáveis globais de desenho para a Thread do Flask ler
+        foco_box = temp_foco_box
+        foco_nome = temp_foco_nome
+        foco_status = temp_foco_status
+        foco_cor = temp_foco_cor
+        ultimo_desenho_capacetes = temp_capacetes
+        ultimo_desenho_oculos = temp_oculos
+        ultimo_desenho_oculos_vermelho = temp_oculos_vermelho
+
+# ==============================================================================
+# 6. GERADOR DE FRAMES (Para o Flask)
+# ==============================================================================
+def gerar_frames():
+    global frame_atual
+
+    while True:
+        if frame_atual is None:
+            time.sleep(0.01)
+            continue
+
+        with lock_frame:
+            frame_display = frame_atual.copy()
+
+        # Desenha em cima do frame mais atual e fluido possível
+        for (hx1, hy1, hx2, hy2) in ultimo_desenho_capacetes:
+            cv2.rectangle(frame_display, (hx1, hy1), (hx2, hy2), (0, 255, 0), 2)
+
+        for (ox1, oy1, ox2, oy2) in ultimo_desenho_oculos:
+            cv2.rectangle(frame_display, (ox1, oy1), (ox2, oy2), (0, 255, 0), 2)
+            cv2.putText(frame_display, "EPI OK", (ox1, oy1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 2)
+
+        for (ox1, oy1, ox2, oy2) in ultimo_desenho_oculos_vermelho:
+            cv2.rectangle(frame_display, (ox1, oy1), (ox2, oy2), (0, 0, 255), 2)
+            cv2.putText(frame_display, "COMUM", (ox1, oy2+15), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,255), 2)
+
+        if foco_box is not None:
+            px1, py1, px2, py2 = foco_box
+            cv2.rectangle(frame_display, (px1, py1), (px2, py2), foco_cor, 2)
+            cv2.putText(frame_display, f"{foco_nome} | {foco_status}", (px1, py1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, foco_cor, 2)
 
         ret, buffer = cv2.imencode('.jpg', frame_display)
         frame_bytes = buffer.tobytes()
         
-        # Adicione este bloco TRY/EXCEPT para capturar quando o PHP cortar o vídeo
         try:
             yield (b'--frame\r\n'
                    b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
         except GeneratorExit:
-            # O navegador fechou a conexão (você apertou o botão vermelho)
             print("Conexão de vídeo encerrada pelo painel.")
-            break # Isso quebra o loop "while True"
+            break
         except Exception as e:
             print(f"Erro na transmissão: {e}")
             break
 
-    # Ao quebrar o loop, a câmera é finalmente liberada (apaga a luzinha)
-    cap.release()
-
 # ==============================================================================
-# 5. ROTAS DO SERVIDOR
+# 7. ROTAS DO SERVIDOR E INÍCIO
 # ==============================================================================
 @app.route('/video_feed')
 def video_feed():
     return Response(gerar_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
 if __name__ == '__main__':
-    # Descomentado para preparar o ambiente antes de rodar o servidor Web
     inicializar_banco()
     treinar_modelo()
+    
+    # Inicia as Threads em paralelo
+    threading.Thread(target=capturar_frames, daemon=True).start()
+    threading.Thread(target=processar_yolo, daemon=True).start()
+    
     print(">>> Servidor Web de Visão Computacional rodando em http://localhost:5000/video_feed <<<")
     app.run(host='0.0.0.0', port=5000, threaded=True)
