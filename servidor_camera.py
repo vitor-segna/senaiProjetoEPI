@@ -424,6 +424,13 @@ def gerar_frames():
 # ==============================================================================
 # 7. ROTAS DO SERVIDOR E INÍCIO
 # ==============================================================================
+
+@app.route('/status_ia')
+def status_ia():
+    global foco_nome, foco_status
+    # Retorna o nome da pessoa que a IA está focando no momento
+    return {"nome": foco_nome, "status": foco_status}
+
 # ==============================================================================
 # 7. ROTAS DO SERVIDOR E INÍCIO
 # ==============================================================================
