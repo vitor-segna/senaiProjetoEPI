@@ -248,6 +248,8 @@ def processar_yolo():
     while True:
         # Trava: Se a câmera estiver desligada, a IA não faz nada
         if not camera_ativa:
+            tempo_infracao.clear() # <--- LIMPA A MEMÓRIA AQUI DENTRO
+            foco_box = None        # <--- Limpa a tela da IA
             time.sleep(0.5)
             continue
 
@@ -422,18 +424,23 @@ def gerar_frames():
 # ==============================================================================
 # 7. ROTAS DO SERVIDOR E INÍCIO
 # ==============================================================================
+# ==============================================================================
+# 7. ROTAS DO SERVIDOR E INÍCIO
+# ==============================================================================
 @app.route('/ligar')
 def ligar_camera():
-    global camera_ativa
+    global camera_ativa, tempo_infracao
     camera_ativa = True
+    tempo_infracao.clear() # Zera o relógio de infrações ao ligar a câmera
     return {"status": "Camera e IA Ligadas"}
 
 @app.route('/desligar')
 def desligar_camera():
-    global camera_ativa, frame_atual
+    global camera_ativa, frame_atual, tempo_infracao
     camera_ativa = False
     with lock_frame:
         frame_atual = None # Limpa o último frame
+    tempo_infracao.clear() # Zera o relógio de infrações ao desligar a câmera
     return {"status": "Camera e IA Desligadas"}
 
 @app.route('/video_feed')
