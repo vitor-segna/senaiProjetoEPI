@@ -136,57 +136,57 @@ def verificar_hsv_capacete(img_crop):
 def verificar_cor_epi_oculos(img_crop):
     if img_crop is None or img_crop.size == 0: return False
     
-    # Redimensiona para padronizar
+    # Padronização
     img_crop = cv2.resize(img_crop, (200, 90))
     img_crop = cv2.GaussianBlur(img_crop, (5,5), 0)
-    h, w = img_crop.shape[:2]
     hsv = cv2.cvtColor(img_crop, cv2.COLOR_BGR2HSV)
+    h, w = img_crop.shape[:2]
 
-    # 1. Expandindo a faixa do Amarelo (para pegar iluminações diferentes/sombras)
-    lower_yellow = np.array([15, 80, 80])
-    upper_yellow = np.array([45, 255, 255])
+    # --- 1. FILTRO DE COR AMARELA (Hastes) ---
+    # Saturação mínima subiu de 80 para 130 (Isso mata o óculos preto/reflexo)
+    # Valor (brilho) mínimo subiu para 100
+    lower_yellow = np.array([18, 130, 100]) 
+    upper_yellow = np.array([35, 255, 255])
     mask_yellow = cv2.inRange(hsv, lower_yellow, upper_yellow)
     
-    # 2. Expandindo a faixa do Vermelho (inclusive vermelhos mais escuros)
-    lower_red1 = np.array([0, 100, 70])
+    # --- 2. FILTRO DE COR VERMELHA (Centro) ---
+    # Saturação mínima subiu para 140 (Ignora tons de pele e reflexos)
+    lower_red1 = np.array([0, 140, 80])
     upper_red1 = np.array([10, 255, 255])
-    lower_red2 = np.array([160, 100, 70])
+    lower_red2 = np.array([165, 140, 80])
     upper_red2 = np.array([180, 255, 255])
     mask_red = cv2.inRange(hsv, lower_red1, upper_red1) + cv2.inRange(hsv, lower_red2, upper_red2)
 
-    # Operações morfológicas para juntar os pedacinhos de cor e tirar ruído
-    kernel = np.ones((5,5), np.uint8)
-    mask_yellow = cv2.morphologyEx(mask_yellow, cv2.MORPH_CLOSE, kernel)
-    mask_red = cv2.morphologyEx(mask_red, cv2.MORPH_CLOSE, kernel)
+    # --- 3. FILTRO ANTI-PRETO/TRANSPARENTE (Segurança extra) ---
+    # Captura o que é muito escuro (Preto) ou muito sem cor (Transparente/Cinza)
+    # Se a imagem for quase toda assim, cancelamos a detecção
+    mask_neutra = cv2.inRange(hsv, np.array([0, 0, 0]), np.array([180, 70, 255]))
+    pixels_neutros = cv2.countNonZero(mask_neutra)
 
-    # 3. Ajustando as Zonas (mais flexíveis para quando virar o rosto)
-    # Aumentando a margem lateral para 40% para pegar as hastes mesmo de perfil
-    largura_lateral = int(w * 0.40) 
-    zona_esquerda = mask_yellow[:, :largura_lateral]
-    zona_direita = mask_yellow[:, w - largura_lateral:]
-    
-    # O centro vermelho foi expandido (de 20% a 80% da largura) para acompanhar a virada de rosto
-    zona_centro = mask_red[:, int(w*0.20):int(w*0.80)]
+    # --- 4. LÓGICA DE ZONAS ---
+    largura_lateral = int(w * 0.35) 
+    zona_esq = mask_yellow[:, :largura_lateral]
+    zona_dir = mask_yellow[:, w - largura_lateral:]
+    zona_centro = mask_red[:, int(w*0.25):int(w*0.75)]
 
-    # Contagem de pixels
-    pixels_esq = cv2.countNonZero(zona_esquerda)
-    pixels_dir = cv2.countNonZero(zona_direita)
-    pixels_centro = cv2.countNonZero(zona_centro)
-    
-    area_lateral = zona_esquerda.shape[0] * zona_esquerda.shape[1]
-    area_centro = zona_centro.shape[0] * zona_centro.shape[1]
+    cnt_esq = cv2.countNonZero(zona_esq)
+    cnt_dir = cv2.countNonZero(zona_dir)
+    cnt_centro = cv2.countNonZero(zona_centro)
 
-    # 4. Reduzindo a exigência de porcentagem (agora 1.5% a 2% de pixels já é suficiente)
-    amarelo_esq = (pixels_esq / area_lateral) > 0.02
-    amarelo_dir = (pixels_dir / area_lateral) > 0.02
-    vermelho_central = (pixels_centro / area_centro) > 0.015
+    # --- 5. CRITÉRIO DE DECISÃO ---
+    # Se mais de 80% da área do óculos for "cor neutra" (preto/transparente), 
+    # ignoramos mesmo que haja um pequeno reflexo.
+    if pixels_neutros > (img_crop.size * 0.85):
+        return False
 
-    # 5. Nova Lógica: Aprova se ver vermelho NO MEIO ou amarelo EM QUALQUER UMA das hastes
-    if vermelho_central or amarelo_esq or amarelo_dir: 
+    # Precisamos de uma "massa" mínima de cor vibrante (mais de 40 pixels)
+    tem_vermelho = cnt_centro > 30
+    tem_amarelo = (cnt_esq > 35 or cnt_dir > 35)
+
+    if tem_vermelho or tem_amarelo:
         return True
         
     return False
-
 # ==============================================================================
 # 4. GERADOR DE FRAMES COM LÓGICA APLICADA
 # ==============================================================================
