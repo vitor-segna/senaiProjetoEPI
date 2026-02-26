@@ -37,6 +37,17 @@ PERSON_CLASS = 3
 ALL_EYEWEAR = [4, 5, 6, 7, 8, 9]
 LIMITE_CONFIANCA_FACE = 60
 
+
+
+# ==============================================================================
+# VARIÁVEIS GLOBAIS (Para comunicação entre as Threads)
+# ==============================================================================
+camera_ativa = True  # <--- NOVA VARIÁVEL AQUI
+
+nomes_conhecidos = {}
+modelo_treinado = False
+tempo_infracao = {}
+
 # ==============================================================================
 # VARIÁVEIS GLOBAIS (Para comunicação entre as Threads)
 # ==============================================================================
@@ -191,19 +202,33 @@ def verificar_cor_epi_oculos(img_crop):
         
     return False
 
+
+# ==============================================================================
 # ==============================================================================
 # 4. THREAD 1: CAPTURA DE CÂMERA (Alta Velocidade)
 # ==============================================================================
 def capturar_frames():
-    global frame_atual
-    # Usando CAP_DSHOW como no seu arquivo para melhor performance no Windows
-    cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
-    cap.set(3, 1280)
-    cap.set(4, 720)
+    global frame_atual, camera_ativa
+    cap = None
 
     while True:
+        # Se a câmera estiver desligada pelo site, solta a webcam e descansa
+        if not camera_ativa:
+            if cap is not None:
+                cap.release()
+                cap = None
+            time.sleep(0.5)
+            continue
+
+        # Se estiver ligada e não tiver iniciado, liga a webcam
+        if cap is None:
+            cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+            cap.set(3, 1280)
+            cap.set(4, 720)
+
         ret, frame = cap.read()
         if not ret:
+            time.sleep(0.01)
             continue
         
         with lock_frame:
@@ -213,7 +238,7 @@ def capturar_frames():
 # 5. THREAD 2: PROCESSAMENTO YOLO, FACIAL E REGRAS (Pesado)
 # ==============================================================================
 def processar_yolo():
-    global frame_atual
+    global frame_atual, camera_ativa
     global ultimo_desenho_capacetes, ultimo_desenho_oculos, ultimo_desenho_oculos_vermelho
     global foco_box, foco_nome, foco_status, foco_cor
     global tempo_infracao, modelo_treinado, nomes_conhecidos
@@ -221,13 +246,19 @@ def processar_yolo():
     frame_count = 0
 
     while True:
+        # Trava: Se a câmera estiver desligada, a IA não faz nada
+        if not camera_ativa:
+            time.sleep(0.5)
+            continue
+
         if frame_atual is None:
             time.sleep(0.01)
             continue
 
         with lock_frame:
             frame = frame_atual.copy()
-
+            
+        # ... (mantenha o restante do seu código igualzinho a partir daqui)
         frame_count += 1
         # Pula alguns frames no processamento pesado para aliviar a CPU/GPU
         # Mantém a fluidez da câmera alta, atualizando o reconhecimento a cada 3 frames
@@ -391,9 +422,24 @@ def gerar_frames():
 # ==============================================================================
 # 7. ROTAS DO SERVIDOR E INÍCIO
 # ==============================================================================
+@app.route('/ligar')
+def ligar_camera():
+    global camera_ativa
+    camera_ativa = True
+    return {"status": "Camera e IA Ligadas"}
+
+@app.route('/desligar')
+def desligar_camera():
+    global camera_ativa, frame_atual
+    camera_ativa = False
+    with lock_frame:
+        frame_atual = None # Limpa o último frame
+    return {"status": "Camera e IA Desligadas"}
+
 @app.route('/video_feed')
 def video_feed():
     return Response(gerar_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
+
 
 if __name__ == '__main__':
     inicializar_banco()
