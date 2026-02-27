@@ -310,7 +310,8 @@ def processar_yolo():
             if len(faces_haar) > 0 and modelo_treinado:
                 (fx, fy, fw, fh) = max(faces_haar, key=lambda b: b[2]*b[3])
                 try:
-                    roi_face = cv2.resize(roi_gray[fy:fy+fh, fx:fx+fw], (200, 200))
+                    fh_corte = int(fh * 0.60)
+                    roi_face = cv2.resize(roi_gray[fy:fy+fh_corte, fx:fx+fw], (200, 200))
                     uid, dist = recognizer.predict(roi_face)
                     if dist < LIMITE_CONFIANCA_FACE:
                         identidade_id = uid

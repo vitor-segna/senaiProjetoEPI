@@ -58,6 +58,7 @@ def treinar_modelo():
                 nparr = np.frombuffer(blob, np.uint8)
                 img = cv2.imdecode(nparr, cv2.IMREAD_GRAYSCALE)
                 if img is not None:
+                    # As imagens no banco já estarão cortadas (nariz para cima) graças à nova lógica
                     faces.append(cv2.resize(img, (200, 200)))
                     ids.append(uid)
         
@@ -76,7 +77,11 @@ def salvar_nova_face(frame_gray, x, y, w, h, uid, nome):
         conn = mysql.connector.connect(**DB_CONFIG)
         cursor = conn.cursor()
         cursor.execute("INSERT INTO alunos (id, nome) VALUES (%s, %s) ON DUPLICATE KEY UPDATE nome=%s", (uid, nome, nome))
-        face_img = cv2.resize(frame_gray[y:y+h, x:x+w], (200, 200))
+        
+        # --- NOVIDADE AQUI: CORTANDO DO NARIZ PARA CIMA (Top 60%) ---
+        h_corte = int(h * 0.60)
+        face_img = cv2.resize(frame_gray[y:y+h_corte, x:x+w], (200, 200))
+        
         _, buf = cv2.imencode('.jpg', face_img)
         cursor.execute("INSERT INTO amostras_facial (aluno_id, imagem) VALUES (%s, %s)", (uid, buf.tobytes()))
         conn.commit()
@@ -95,7 +100,7 @@ modo_cadastro = False
 cadastro_count = 0
 cad_id, cad_nome = 0, ""
 
-print("\n>>> RECONHECIMENTO FACIAL ATIVO")
+print("\n>>> RECONHECIMENTO FACIAL ATIVO (FOCO NARIZ-TESTA)")
 print(">>> 'c' para cadastrar novo aluno | 'q' para sair\n")
 
 while True:
@@ -106,12 +111,20 @@ while True:
     faces_detectadas = face_cascade.detectMultiScale(gray, 1.3, 5)
 
     for (x, y, w, h) in faces_detectadas:
+        
+        # Calcula a altura do corte (60% da caixa original - pega testa, olhos e início do nariz)
+        h_corte = int(h * 0.60)
+        
         if modo_cadastro:
             # LÓGICA DE CADASTRO
             if cadastro_count < 25:
                 cadastro_count += 1
                 salvar_nova_face(gray, x, y, w, h, cad_id, cad_nome)
-                cv2.rectangle(frame, (x, y), (x+w, y+h), (255, 165, 0), 2)
+                
+                # Desenha o quadrado inteiro suave e a linha de corte
+                cv2.rectangle(frame, (x, y), (x+w, y+h), (255, 165, 0), 1)
+                cv2.line(frame, (x, y+h_corte), (x+w, y+h_corte), (255, 165, 0), 2)
+                
                 cv2.putText(frame, f"Capturando {cadastro_count}/25", (x, y-10), 
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 165, 0), 2)
                 time.sleep(0.05)
@@ -119,7 +132,7 @@ while True:
                 modo_cadastro = False
                 treinar_modelo()
                 cadastro_count = 0
-                print(f"[SUCESSO] {cad_nome} cadastrado!")
+                print(f"[SUCESSO] {cad_nome} cadastrado com foco superior!")
         
         else:
             # LÓGICA DE RECONHECIMENTO
@@ -127,14 +140,17 @@ while True:
             cor = (0, 0, 255) # Vermelho para desconhecido
 
             if modelo_treinado:
-                roi_gray = cv2.resize(gray[y:y+h, x:x+w], (200, 200))
+                # --- NOVIDADE AQUI: Passando apenas a parte superior do rosto para o IA ---
+                roi_gray = cv2.resize(gray[y:y+h_corte, x:x+w], (200, 200))
                 uid, confidencia = recognizer.predict(roi_gray)
 
                 if confidencia < LIMITE_CONFIANCA_FACE:
                     id_nome = nomes_conhecidos.get(uid, f"ID {uid}")
                     cor = (0, 255, 0) # Verde para conhecido
             
-            cv2.rectangle(frame, (x, y), (x+w, y+h), cor, 2)
+            # Desenha a caixa na tela (destacando a área lida)
+            cv2.rectangle(frame, (x, y), (x+w, y+h), cor, 1)
+            cv2.line(frame, (x, y+h_corte), (x+w, y+h_corte), cor, 2) # Linha mostrando o foco
             cv2.putText(frame, id_nome, (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, cor, 2)
 
     cv2.imshow("Cadastro e Reconhecimento Facial", frame)
