@@ -21,7 +21,10 @@ DB_CONFIG = {
 # 2. INICIALIZAÇÃO DOS MODELOS DE FACE
 # ==============================================================================
 print("[SISTEMA] Carregando Modelos de Face...")
-face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+# NOVIDADE: Carregando tanto o rosto de frente quanto o de perfil!
+cascade_frente = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+cascade_perfil = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_profileface.xml')
+
 recognizer = cv2.face.LBPHFaceRecognizer_create()
 
 nomes_conhecidos = {}
@@ -29,7 +32,7 @@ modelo_treinado = False
 LIMITE_CONFIANCA_FACE = 60
 
 # ==============================================================================
-# 3. FUNÇÕES DE BANCO E TREINAMENTO
+# 3. FUNÇÕES DE BANCO E TREINAMENTO (Mantido Intacto)
 # ==============================================================================
 def inicializar_banco():
     try:
@@ -58,7 +61,6 @@ def treinar_modelo():
                 nparr = np.frombuffer(blob, np.uint8)
                 img = cv2.imdecode(nparr, cv2.IMREAD_GRAYSCALE)
                 if img is not None:
-                    # As imagens no banco já estarão cortadas (nariz para cima) graças à nova lógica
                     faces.append(cv2.resize(img, (200, 200)))
                     ids.append(uid)
         
@@ -78,7 +80,6 @@ def salvar_nova_face(frame_gray, x, y, w, h, uid, nome):
         cursor = conn.cursor()
         cursor.execute("INSERT INTO alunos (id, nome) VALUES (%s, %s) ON DUPLICATE KEY UPDATE nome=%s", (uid, nome, nome))
         
-        # --- NOVIDADE AQUI: CORTANDO DO NARIZ PARA CIMA (Top 60%) ---
         h_corte = int(h * 0.60)
         face_img = cv2.resize(frame_gray[y:y+h_corte, x:x+w], (200, 200))
         
@@ -100,32 +101,90 @@ modo_cadastro = False
 cadastro_count = 0
 cad_id, cad_nome = 0, ""
 
-print("\n>>> RECONHECIMENTO FACIAL ATIVO (FOCO NARIZ-TESTA)")
+# Variáveis para a "Memória Visual"
+ultima_face = None
+frames_sem_rosto = 0
+
+print("\n>>> RECONHECIMENTO FACIAL ATIVO (FOCO 360 + DESFOQUE NATIVO)")
 print(">>> 'c' para cadastrar novo aluno | 'q' para sair\n")
 
 while True:
     ret, frame = cap.read()
     if not ret: break
     
+    h_frame, w_frame = frame.shape[:2]
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    faces_detectadas = face_cascade.detectMultiScale(gray, 1.3, 5)
-
-    for (x, y, w, h) in faces_detectadas:
+    
+    # --- 1. DETECÇÃO 360 GRAUS ---
+    todas_caixas = []
+    
+    # Detecta rosto de frente
+    faces_frente = cascade_frente.detectMultiScale(gray, 1.3, 5)
+    for caixa in faces_frente: todas_caixas.append(caixa)
         
-        # Calcula a altura do corte (60% da caixa original - pega testa, olhos e início do nariz)
+    # Detecta rosto de perfil (virado para um lado)
+    faces_perfil = cascade_perfil.detectMultiScale(gray, 1.3, 5)
+    for caixa in faces_perfil: todas_caixas.append(caixa)
+        
+    # Detecta rosto de perfil (virado para o outro lado espelhando a imagem)
+    gray_espelhado = cv2.flip(gray, 1)
+    faces_perfil_esq = cascade_perfil.detectMultiScale(gray_espelhado, 1.3, 5)
+    for (x, y, w, h) in faces_perfil_esq:
+        # Desfaz o espelhamento para pegar a coordenada real na tela
+        x_real = w_frame - x - w
+        todas_caixas.append((x_real, y, w, h))
+
+    # --- 2. ESCOLHER O ROSTO PRINCIPAL E USAR A MEMÓRIA ---
+    rosto_principal = None
+    maior_area = 0
+    
+    # Pega apenas a maior caixa detectada (para evitar bugar se detectar frente e perfil junto)
+    for (x, y, w, h) in todas_caixas:
+        area = w * h
+        if area > maior_area:
+            maior_area = area
+            rosto_principal = (x, y, w, h)
+            
+    # Sistema de Memória: Se perder o rosto, lembra onde estava por 15 frames
+    if rosto_principal is not None:
+        ultima_face = rosto_principal
+        frames_sem_rosto = 0
+    else:
+        frames_sem_rosto += 1
+        if frames_sem_rosto < 15 and ultima_face is not None:
+            rosto_principal = ultima_face # Usa a memória para não desfocar
+        else:
+            ultima_face = None # Esquece de vez após muito tempo
+
+    # --- 3. EFEITO DE DESFOQUE ---
+    fundo_desfocado = cv2.GaussianBlur(frame, (71, 71), 0)
+    mask = np.zeros_like(gray)
+
+    if rosto_principal is not None:
+        (x, y, w, h) = rosto_principal
+        centro = (x + w // 2, y + h // 2)
+        eixos = (int(w * 0.9), int(h * 1.3)) 
+        cv2.ellipse(mask, centro, eixos, 0, 0, 360, 255, -1)
+
+    mask_suave = cv2.GaussianBlur(mask, (51, 51), 0)
+    mask_3d = cv2.cvtColor(mask_suave, cv2.COLOR_GRAY2BGR) / 255.0
+
+    frame_final = (frame * mask_3d + fundo_desfocado * (1 - mask_3d)).astype(np.uint8)
+
+    # --- 4. APLICAÇÃO DE RECONHECIMENTO ---
+    if rosto_principal is not None:
+        (x, y, w, h) = rosto_principal
         h_corte = int(h * 0.60)
         
         if modo_cadastro:
-            # LÓGICA DE CADASTRO
             if cadastro_count < 25:
                 cadastro_count += 1
                 salvar_nova_face(gray, x, y, w, h, cad_id, cad_nome)
                 
-                # Desenha o quadrado inteiro suave e a linha de corte
-                cv2.rectangle(frame, (x, y), (x+w, y+h), (255, 165, 0), 1)
-                cv2.line(frame, (x, y+h_corte), (x+w, y+h_corte), (255, 165, 0), 2)
+                cv2.rectangle(frame_final, (x, y), (x+w, y+h), (255, 165, 0), 1)
+                cv2.line(frame_final, (x, y+h_corte), (x+w, y+h_corte), (255, 165, 0), 2)
                 
-                cv2.putText(frame, f"Capturando {cadastro_count}/25", (x, y-10), 
+                cv2.putText(frame_final, f"Capturando {cadastro_count}/25", (x, y-10), 
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 165, 0), 2)
                 time.sleep(0.05)
             else:
@@ -135,25 +194,25 @@ while True:
                 print(f"[SUCESSO] {cad_nome} cadastrado com foco superior!")
         
         else:
-            # LÓGICA DE RECONHECIMENTO
-            id_nome = "Desconhecido"
-            cor = (0, 0, 255) # Vermelho para desconhecido
+            # OBS: O reconhecimento funciona melhor de frente. De lado ele pode dar "Desconhecido", 
+            # mas o DESFOQUE (foco) agora vai continuar em você graças à lógica 360!
+            id_nome = "Analisando..."
+            cor = (0, 0, 255) 
 
             if modelo_treinado:
-                # --- NOVIDADE AQUI: Passando apenas a parte superior do rosto para o IA ---
+                # Usa a imagem cinza original (nítida) para o IA analisar
                 roi_gray = cv2.resize(gray[y:y+h_corte, x:x+w], (200, 200))
                 uid, confidencia = recognizer.predict(roi_gray)
 
                 if confidencia < LIMITE_CONFIANCA_FACE:
                     id_nome = nomes_conhecidos.get(uid, f"ID {uid}")
-                    cor = (0, 255, 0) # Verde para conhecido
+                    cor = (0, 255, 0) 
             
-            # Desenha a caixa na tela (destacando a área lida)
-            cv2.rectangle(frame, (x, y), (x+w, y+h), cor, 1)
-            cv2.line(frame, (x, y+h_corte), (x+w, y+h_corte), cor, 2) # Linha mostrando o foco
-            cv2.putText(frame, id_nome, (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, cor, 2)
+            cv2.rectangle(frame_final, (x, y), (x+w, y+h), cor, 1)
+            cv2.line(frame_final, (x, y+h_corte), (x+w, y+h_corte), cor, 2) 
+            cv2.putText(frame_final, id_nome, (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, cor, 2)
 
-    cv2.imshow("Cadastro e Reconhecimento Facial", frame)
+    cv2.imshow("Cadastro e Reconhecimento Facial", frame_final)
     
     key = cv2.waitKey(1)
     if key == ord('q'): 
